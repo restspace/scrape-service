@@ -4,6 +4,12 @@
 rapiderit.com RS2 node. You are installing a new service alongside RS2 and
 adding two mounts to its tenant config.
 
+**Source:** https://github.com/restspace/scrape-service — you are reading this
+from a clone of it. Work through the sections in order; sections 1 and 6 have
+checks that are hard stops, and they are there because the failure modes are
+"a live client site goes down" and "an open SSRF proxy on the public internet",
+not "the crawl is slow".
+
 **Host budget you are working within: 4 GB RAM, 40 GB disk — shared with the
 RS2 node that serves live client sites.** That constraint drives most of the
 non-obvious choices below. Do not raise the limits to "make it faster" without
@@ -102,11 +108,13 @@ Everything else can stay at its default.
 # third-party websites and should own nothing it does not need.
 sudo useradd --system --create-home --home-dir /var/lib/scrape-service --shell /usr/sbin/nologin scrape
 
-sudo mkdir -p /opt/scrape-service
-# Copy the repo to /opt/scrape-service (git clone, rsync, or scp — whatever this
-# host normally uses). Then:
+# Clone to its install location. If you already cloned somewhere else to read
+# this file, move that clone rather than keeping two copies.
+sudo git clone https://github.com/restspace/scrape-service.git /opt/scrape-service
+sudo chown -R scrape:scrape /opt/scrape-service
+
 cd /opt/scrape-service
-sudo -u scrape npm ci --omit=dev
+sudo -u scrape npm ci
 
 # System libraries for Chromium. --with-deps is what makes this work on a bare
 # server; without it Chromium installs and then fails to launch on a missing .so.
