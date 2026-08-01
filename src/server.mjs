@@ -399,6 +399,11 @@ export async function loadConfig() {
   if (process.env.ARTEFACT_ROOT) raw.server.artefactRoot = process.env.ARTEFACT_ROOT;
   if (process.env.JOB_ROOT) raw.server.jobRoot = process.env.JOB_ROOT;
   if (process.env.CONCURRENT_JOBS) raw.server.concurrentJobs = Number(process.env.CONCURRENT_JOBS);
+  // Sizing knobs a small host needs to tighten without editing the config file.
+  if (process.env.ARTEFACT_TTL_DAYS) raw.gc.ttlDays = Number(process.env.ARTEFACT_TTL_DAYS);
+  if (process.env.DISK_HIGH_WATER_PCT) raw.gc.diskHighWaterPct = Number(process.env.DISK_HIGH_WATER_PCT);
+  if (process.env.ARTEFACT_BYTES_PER_JOB) raw.limits.artefactBytesPerJob = Number(process.env.ARTEFACT_BYTES_PER_JOB);
+  if (process.env.MAX_PAGES_CEILING) raw.limits.maxPagesCeiling = Number(process.env.MAX_PAGES_CEILING);
   return raw;
 }
 

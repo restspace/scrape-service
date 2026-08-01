@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import readline from 'node:readline';
 
 import { STATUS } from './store.mjs';
+import { dirSize } from './gc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RUN_JOB = path.join(here, '..', 'workers', 'run-job.mjs');
@@ -90,17 +91,40 @@ export class JobQueue {
 
     const budget = this.#wallClockFor(job.kind);
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      this.logger.warn?.(`job ${job.jobId} exceeded ${budget}ms — terminating`);
+    let oversized = false;
+    const stop = (why) => {
       // SIGTERM first so the worker can close chromium; the child translates it
       // into a cooperative abort. SIGKILL only if it will not go.
+      this.logger.warn?.(`job ${job.jobId} ${why} — terminating`);
       child.kill('SIGTERM');
       setTimeout(() => child.kill('SIGKILL'), 10_000).unref?.();
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop(`exceeded ${budget}ms`);
     }, budget);
     timer.unref?.();
 
-    this.running.set(job.jobId, { child, timer });
+    // Enforce the per-job artefact cap while the job runs, not after it. A
+    // runaway crawl on a small disk can fill the filesystem the RS2 node serves
+    // client sites from, so noticing at completion time would be too late.
+    const cap = this.limits.artefactBytesPerJob;
+    const sizeTimer = cap
+      ? setInterval(async () => {
+          try {
+            const bytes = await dirSize(this.store.artefactDir(job.jobId));
+            if (bytes > cap) {
+              oversized = true;
+              clearInterval(sizeTimer);
+              stop(`artefacts reached ${bytes} bytes (cap ${cap})`);
+            }
+          } catch { /* the dir may vanish under a concurrent delete */ }
+        }, 30_000)
+      : null;
+    sizeTimer?.unref?.();
+
+    this.running.set(job.jobId, { child, timer, sizeTimer });
 
     this.store.update(job.jobId, {
       status: STATUS.RUNNING,
@@ -149,6 +173,7 @@ export class JobQueue {
 
     child.on('close', async (code, signal) => {
       clearTimeout(timer);
+      if (sizeTimer) clearInterval(sizeTimer);
       this.running.delete(job.jobId);
       rl.close();
 
@@ -160,7 +185,12 @@ export class JobQueue {
 
       if (pending) await this.store.mergeProgress(job.jobId, stripUndefined(pending)).catch(() => {});
 
-      if (timedOut) {
+      if (oversized) {
+        await this.store.update(job.jobId, {
+          status: STATUS.FAILED, finishedAt, pid: null,
+          error: { code: 'artefact_cap_exceeded', message: `job artefacts exceeded the ${cap}-byte cap` },
+        });
+      } else if (timedOut) {
         await this.store.update(job.jobId, {
           status: STATUS.FAILED, finishedAt, pid: null,
           error: { code: 'wall_clock_exceeded', message: `job exceeded its ${budget}ms budget` },
@@ -192,6 +222,7 @@ export class JobQueue {
     const entry = this.running.get(jobId);
     if (!entry) return false;
     clearTimeout(entry.timer);
+    if (entry.sizeTimer) clearInterval(entry.sizeTimer);
     await this.store.update(jobId, {
       status: STATUS.CANCELLED,
       finishedAt: new Date().toISOString(),
