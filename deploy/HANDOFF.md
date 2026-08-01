@@ -250,7 +250,7 @@ done
 # 5. A real crawl end to end
 curl -s -X POST https://rapiderit.com/scrape/crawls \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"rootUrl":"http://www.fdca.co.uk","maxPages":3}' | jq
+  -d '{"rootUrl":"https://example.com/","maxPages":3}' | jq
 # poll until succeeded, then:
 curl -s -H "Authorization: Bearer $TOKEN" \
   https://rapiderit.com/scrape-runs/<jobId>/crawl.json | jq '.crawl'

@@ -60,7 +60,7 @@ test('rejects embedded credentials and non-public hostnames', () => {
 });
 
 test('accepts ordinary public URLs', () => {
-  for (const url of ['https://example.co.uk/', 'http://www.fdca.co.uk', 'https://sub.example.com:8443/a?b=c']) {
+  for (const url of ['https://example.co.uk/', 'http://www.example.org', 'https://sub.example.com:8443/a?b=c']) {
     assert.ok(assertSubmittable(url) instanceof URL, url);
   }
 });

@@ -26,7 +26,10 @@ for (let i = 0; i < args.length; i++) {
     else { opt[k] = v; i++; }
   }
 }
-const URL_UNDER_TEST = opt.url ?? 'http://www.fdca.co.uk';
+// Defaults to example.com: it exists to be fetched by tools like this one, so
+// a fresh clone running `npm run smoke` does not crawl a real business's site
+// without meaning to. Pass --url to point at something more substantial.
+const URL_UNDER_TEST = opt.url ?? 'https://example.com/';
 const MAX_PAGES = Number(opt.max ?? 2);
 
 const quiet = { info() {}, warn(m) { console.warn('  ! ' + m); }, error(m) { console.error('  ! ' + m); } };
