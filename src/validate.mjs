@@ -139,3 +139,78 @@ export function validateCrawlRequest(body, limits) {
 
   return spec;
 }
+
+const SCAN_FIELDS = new Set(['candidates', 'concurrency', 'maxPagesPerSite', 'siteBudgetMs', 'respectRobotsTxt', 'force']);
+
+/** Validate and normalise a batch-scan request into a job spec. */
+export function validateScanRequest(body, limits) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('body_invalid', 'request body must be a JSON object');
+  }
+  rejectUnknown(body, SCAN_FIELDS, 'scan');
+
+  if (!Array.isArray(body.candidates) || body.candidates.length === 0) {
+    throw new ValidationError('field_required', "'candidates' must be a non-empty array", 'candidates');
+  }
+  if (body.candidates.length > limits.maxCandidatesPerScan) {
+    throw new ValidationError(
+      'field_exceeds_ceiling',
+      `'candidates' has ${body.candidates.length} entries but this server's ceiling is ${limits.maxCandidatesPerScan}`,
+      'candidates',
+    );
+  }
+
+  const candidates = body.candidates.map((c, i) => {
+    const url = typeof c === 'string' ? c : c?.url;
+    if (typeof url !== 'string' || !url.trim()) {
+      throw new ValidationError('field_invalid', `candidates[${i}] needs a 'url'`, `candidates[${i}].url`);
+    }
+    const entry = { url: url.trim() };
+    if (typeof c === 'object' && c) {
+      if (c.name !== undefined) {
+        if (typeof c.name !== 'string') throw new ValidationError('field_invalid', `candidates[${i}].name must be a string`, `candidates[${i}].name`);
+        entry.name = c.name;
+      }
+      if (c.slug !== undefined) {
+        if (typeof c.slug !== 'string' || !/^[a-z0-9-]+$/i.test(c.slug)) {
+          // Slugs become directory names under the artefact root, so anything
+          // path-shaped is refused here rather than sanitised silently.
+          throw new ValidationError('field_invalid', `candidates[${i}].slug must match ^[a-z0-9-]+$`, `candidates[${i}].slug`);
+        }
+        entry.slug = c.slug;
+      }
+      for (const k of Object.keys(c)) {
+        if (!['url', 'name', 'slug', 'id'].includes(k)) {
+          throw new ValidationError('unknown_field', `unknown field '${k}' in candidates[${i}]`, `candidates[${i}].${k}`);
+        }
+      }
+    }
+    return entry;
+  });
+
+  const spec = { candidates };
+
+  const concurrency = optionalInt(body, 'concurrency', { min: 1, max: 8 });
+  if (concurrency !== undefined) spec.concurrency = concurrency;
+
+  const maxPagesPerSite = optionalInt(body, 'maxPagesPerSite', { min: 1, max: 10 });
+  if (maxPagesPerSite !== undefined) spec.maxPagesPerSite = maxPagesPerSite;
+
+  const siteBudgetMs = optionalInt(body, 'siteBudgetMs', { min: 10_000, max: 300_000 });
+  if (siteBudgetMs !== undefined) spec.siteBudgetMs = siteBudgetMs;
+
+  const force = optionalBool(body, 'force');
+  if (force !== undefined) spec.force = force;
+
+  const respectRobots = optionalBool(body, 'respectRobotsTxt');
+  if (respectRobots === false && !limits.allowRobotsOverride) {
+    throw new ValidationError(
+      'robots_override_forbidden',
+      'this server does not allow respectRobotsTxt:false',
+      'respectRobotsTxt',
+    );
+  }
+  if (respectRobots !== undefined) spec.respectRobotsTxt = respectRobots;
+
+  return spec;
+}

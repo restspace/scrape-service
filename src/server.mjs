@@ -10,14 +10,14 @@
 // also accepted so that a direct curl can use the same path as the public URL.
 
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { JobStore, STATUS, TERMINAL } from './jobs/store.mjs';
 import { JobQueue } from './jobs/queue.mjs';
 import { ArtefactGC, diskUsagePct } from './jobs/gc.mjs';
-import { validateCrawlRequest, ValidationError } from './validate.mjs';
+import { validateCrawlRequest, validateScanRequest, ValidationError } from './validate.mjs';
 import { assertNavigable, BlockedUrlError } from './net/guard.mjs';
 import { chromiumVersion } from './capture/browser.mjs';
 
@@ -25,7 +25,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const MAX_BODY_BYTES = 1_000_000;
 
 /** Job kinds with a worker behind them. Anything else is an explicit 501. */
-const IMPLEMENTED_KINDS = new Set(['crawl']);
+const IMPLEMENTED_KINDS = new Set(['crawl', 'scan']);
 
 export async function createServer({ config, logger = console }) {
   const store = new JobStore({
@@ -92,6 +92,9 @@ export async function createServer({ config, logger = console }) {
       return methodNotAllowed(res, ['POST', 'GET']);
     }
     if (sub === 'log' && req.method === 'GET') return jobLog(res, id);
+    if (sub === 'artefacts' && req.method === 'GET') {
+      return artefacts(res, id, segments.slice(3).join('/'));
+    }
     if (sub) return sendJson(res, 404, { error: { code: 'not_found', message: `no route for ${pathname}` } });
     if (req.method === 'GET') return getJob(res, id);
     if (req.method === 'DELETE') return deleteJob(res, id);
@@ -117,11 +120,28 @@ export async function createServer({ config, logger = console }) {
 
   async function createJob(req, res, kind) {
     const body = await readJsonBody(req);
-    const spec = validateCrawlRequest(body, config.limits);
+    const spec = kind === 'scan'
+      ? validateScanRequest(body, config.limits)
+      : validateCrawlRequest(body, config.limits);
 
     // Fail fast and legibly: a caller who posts a private address should get a
     // 400 now, not a job that fails a minute later with a cryptic worker error.
-    await assertNavigable(spec.rootUrl);
+    //
+    // A crawl has one target, so a bad one is fatal. A scan has many, and one
+    // bad candidate out of two hundred should not reject the batch — those are
+    // checked per site by the worker and recorded as that site's outcome. What
+    // is rejected here is a batch where nothing at all is fetchable, which is
+    // always a caller mistake.
+    if (kind === 'scan') {
+      const checks = await Promise.all(
+        spec.candidates.map((c) => assertNavigable(c.url).then(() => true, () => false)),
+      );
+      if (!checks.some(Boolean)) {
+        throw new ValidationError('field_invalid', 'no candidate URL is fetchable', 'candidates');
+      }
+    } else {
+      await assertNavigable(spec.rootUrl);
+    }
 
     const duplicate = await store.findDuplicate(kind, spec, { windowMs: config.server.dedupeWindowMs });
     if (duplicate) {
@@ -157,7 +177,9 @@ export async function createServer({ config, logger = console }) {
   async function jobLog(res, id) {
     const job = await store.get(id);
     if (!job) return sendJson(res, 404, { error: { code: 'not_found', message: `no job '${id}'` } });
-    const logPath = path.join(store.artefactDir(id), 'logs', 'crawl.log');
+    // Each worker names its own log after its kind; crawl.log is the one the
+    // pipeline's client shim mirrors into runs/<slug>/.
+    const logPath = path.join(store.artefactDir(id), 'logs', `${job.kind}.log`);
     try {
       const text = await readFile(logPath, 'utf8');
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
@@ -167,6 +189,43 @@ export async function createServer({ config, logger = console }) {
       // truer answer than a 404 for a job that is queued or still starting.
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('');
+    }
+  }
+
+  /**
+   * Artefact access.
+   *
+   * With no sub-path this returns a flat recursive manifest; with one it
+   * streams that file. The RS2 `/scrape-runs` file mount serves the same tree
+   * for humans, but clients use this so there is exactly one download path that
+   * behaves identically against a local sidecar and through the proxy.
+   */
+  async function artefacts(res, id, relPath) {
+    const job = await store.get(id);
+    if (!job) return sendJson(res, 404, { error: { code: 'not_found', message: `no job '${id}'` } });
+
+    const root = store.artefactDir(id);
+    if (!relPath) {
+      const files = await manifest(root);
+      return sendJson(res, 200, { jobId: id, files });
+    }
+
+    // Resolve then verify containment: the only reliable defence against
+    // traversal, encoded or otherwise.
+    const decoded = decodeURIComponent(relPath);
+    const target = path.resolve(root, decoded);
+    if (target !== root && !target.startsWith(root + path.sep)) {
+      return sendJson(res, 400, { error: { code: 'path_escape', message: 'artefact path escapes the job directory' } });
+    }
+    try {
+      const data = await readFile(target);
+      res.writeHead(200, {
+        'content-type': contentTypeFor(target),
+        'content-length': data.length,
+      });
+      res.end(data);
+    } catch {
+      sendJson(res, 404, { error: { code: 'not_found', message: `no artefact '${decoded}'` } });
     }
   }
 
@@ -229,6 +288,46 @@ function jobView(job) {
     artefacts: `/scrape-runs/${job.jobId}/`,
     self: `/scrape/${job.kind}s/${job.jobId}`,
   };
+}
+
+/** Flat recursive listing of a job's artefacts, with forward-slash paths. */
+async function manifest(root) {
+  const files = [];
+  const walk = async (dir, prefix) => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const abs = path.join(dir, e.name);
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) await walk(abs, rel);
+      else {
+        try { files.push({ path: rel, bytes: (await stat(abs)).size }); } catch { /* raced with GC */ }
+      }
+    }
+  };
+  await walk(root, '');
+  return files;
+}
+
+const CONTENT_TYPES = {
+  '.json': 'application/json; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
+  '.log': 'text/plain; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+};
+
+function contentTypeFor(p) {
+  return CONTENT_TYPES[path.extname(p).toLowerCase()] ?? 'application/octet-stream';
 }
 
 function sendJson(res, status, body) {

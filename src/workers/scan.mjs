@@ -1,48 +1,37 @@
-#!/usr/bin/env node
-// Stage 1a — shallow batch capture for prospect qualification.
+// Shallow batch capture for prospect qualification.
+//
 // Scans every candidate site (home + up to 3-4 key pages), desktop + mobile,
 // and writes per-site capture artefacts. Optimised for throughput, not
-// completeness (no robots/sitemap discovery, no BFS, no asset inventory).
+// completeness (no sitemap discovery, no BFS, no asset inventory).
 // No LLM here — this captures what exists. Dead sites are a signal, not an error.
 //
-// Usage:
-//   node scan.mjs --out <batch-dir>                 # reads <batch-dir>/candidates.json
-//   node scan.mjs --out <batch-dir> --concurrency 4 --only <slug> --force
+// Ported from the pipeline's scan.mjs. The per-site capture logic is unchanged;
+// what changed is the shell around it, and two deliberate behaviour changes:
 //
-// Requires: playwright (chromium). If missing: npx playwright install chromium
+//   * robots.txt is now honoured. The original ignored it entirely, which was
+//     defensible for a hand-picked local batch and is not defensible for a
+//     server that scans hundreds of third-party sites unattended.
+//   * every candidate URL passes the SSRF guard, and per-domain politeness is
+//     shared with any concurrent crawl job.
+//
+// The batch.json resume model is kept as-is: it was already the better of the
+// two workers in this respect, and the job engine relies on it to make a
+// restarted scan pick up where it left off.
 
-import { chromium } from 'playwright';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+import { launchBrowser } from '../capture/browser.mjs';
+import { extractInPage, SCAN_CAPABILITIES } from '../capture/extract.mjs';
+import { loadRobots, makeRobotsBlocker } from '../capture/robots.mjs';
+import { checkFrontierUrl } from '../net/guard.mjs';
 
-function parseArgs(argv) {
-  const a = {};
-  for (let i = 2; i < argv.length; i++) {
-    const k = argv[i];
-    if (k === '--out') a.out = argv[++i];
-    else if (k === '--config') a.config = argv[++i];
-    else if (k === '--concurrency') a.concurrency = parseInt(argv[++i], 10);
-    else if (k === '--only') a.only = argv[++i];
-    else if (k === '--force') a.force = true;
-    else if (k === '--max') a.max = parseInt(argv[++i], 10);
+export class ScanAbortedError extends Error {
+  constructor(reason) {
+    super(`scan aborted: ${reason}`);
+    this.name = 'ScanAbortedError';
+    this.code = 'aborted';
   }
-  return a;
-}
-
-export async function loadConfig(configPath) {
-  const cfg = JSON.parse(await readFile(path.join(SCRIPT_DIR, 'scan-config.default.json'), 'utf8'));
-  if (configPath) {
-    const raw = JSON.parse(await readFile(configPath, 'utf8'));
-    // shallow merge, one level deep for objects
-    for (const [k, v] of Object.entries(raw)) {
-      if (v && typeof v === 'object' && !Array.isArray(v) && cfg[k] && typeof cfg[k] === 'object') cfg[k] = { ...cfg[k], ...v };
-      else cfg[k] = v;
-    }
-  }
-  return cfg;
 }
 
 // ---------- pre-flight probe (no browser) ----------
@@ -104,148 +93,10 @@ export async function preflight(candidateUrl, timeoutMs) {
   return { http, https, httpLandsOnHttps, browseUrl, dead: !browseUrl };
 }
 
-// ---------- in-page extraction (runs in browser, desktop) ----------
-// Trimmed from website-reconstruction/scripts/crawl.mjs extractInPage:
-// keeps metadata/links/forms/buttons/structured-data/visible-text, drops
-// images/blocks/a11y-tree/readable (completeness features the shallow scan skips).
-function extractInPage() {
-  const cssPath = (el) => {
-    if (!(el instanceof Element)) return null;
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === 1 && parts.length < 6) {
-      let sel = node.nodeName.toLowerCase();
-      if (node.id) { parts.unshift(`${sel}#${node.id}`); break; }
-      const parent = node.parentNode;
-      if (parent) {
-        const sameTag = Array.from(parent.children).filter((c) => c.nodeName === node.nodeName);
-        if (sameTag.length > 1) sel += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
-      }
-      parts.unshift(sel);
-      node = node.parentNode;
-    }
-    return parts.join(' > ');
-  };
-  const regionOf = (el) => {
-    let n = el;
-    while (n) {
-      const tag = n.nodeName ? n.nodeName.toLowerCase() : '';
-      const role = n.getAttribute ? n.getAttribute('role') : null;
-      if (tag === 'header' || role === 'banner') return 'header';
-      if (tag === 'nav' || role === 'navigation') return 'navigation';
-      if (tag === 'footer' || role === 'contentinfo') return 'footer';
-      if (tag === 'main' || role === 'main') return 'main';
-      if (tag === 'aside') return 'aside';
-      n = n.parentElement;
-    }
-    return 'body';
-  };
-  const vh = window.innerHeight;
-  const visible = (el) => {
-    const r = el.getBoundingClientRect();
-    const st = getComputedStyle(el);
-    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
-  };
-
-  const origin = location.origin;
-  const links = [...document.querySelectorAll('a[href]')]
-    .map((a) => {
-      const href = a.href;
-      let type = 'internal';
-      if (href.startsWith('mailto:')) type = 'email';
-      else if (href.startsWith('tel:')) type = 'phone';
-      else if (!href.startsWith(origin)) type = 'external';
-      return { text: a.textContent.trim().slice(0, 160), href, type, selector: cssPath(a), appearsIn: regionOf(a) };
-    })
-    .filter((l) => l.href);
-
-  const forms = [...document.querySelectorAll('form')].map((f) => ({
-    selector: cssPath(f),
-    method: (f.getAttribute('method') || 'GET').toUpperCase(),
-    action: f.getAttribute('action') || '',
-    // markers that indicate a JS-handled form (empty action is then fine)
-    markers: (f.className + ' ' + (f.id || '') + ' ' + (f.getAttribute('data-hs-form') ? 'hs-form' : '') + ' ' + (f.getAttribute('data-netlify') ? 'netlify' : '')).toLowerCase().slice(0, 300),
-    fields: [...f.querySelectorAll('input,textarea,select')]
-      .filter((el) => el.type !== 'hidden')
-      .map((el) => {
-        let label = '';
-        if (el.id) {
-          const lab = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-          if (lab) label = lab.textContent.trim();
-        }
-        if (!label) label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name || '';
-        return {
-          name: el.name || '',
-          label: label.slice(0, 120),
-          type: el.tagName.toLowerCase() === 'textarea' ? 'textarea' : el.type || el.tagName.toLowerCase(),
-          required: el.required || false,
-        };
-      }),
-  }));
-
-  const ctaSel = 'button, a.btn, a.button, a.cta, [class*="btn"], [role="button"]';
-  const buttons = [...document.querySelectorAll(ctaSel)]
-    .filter(visible)
-    .slice(0, 40)
-    .map((b) => {
-      const r = b.getBoundingClientRect();
-      return {
-        text: b.textContent.trim().slice(0, 120),
-        target: b.tagName.toLowerCase() === 'a' ? b.href : (b.getAttribute('formaction') || null),
-        selector: cssPath(b),
-        position: r.top < vh ? 'above_fold' : 'below_fold',
-      };
-    })
-    .filter((b) => b.text);
-
-  const structuredData = [];
-  for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
-    try { structuredData.push(JSON.parse(s.textContent)); } catch { /* skip invalid */ }
-  }
-
-  const metaGet = (sel, attr = 'content') => {
-    const el = document.querySelector(sel);
-    return el ? el.getAttribute(attr) : null;
-  };
-  const iconLinks = [...document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"], link[rel="apple-touch-icon"]')]
-    .map((l) => ({ rel: l.getAttribute('rel'), href: l.href }));
-  const metadata = {
-    title: document.title || null,
-    metaDescription: metaGet('meta[name="description"]'),
-    canonicalUrl: metaGet('link[rel="canonical"]', 'href'),
-    generator: metaGet('meta[name="generator"]'),
-    viewportMeta: metaGet('meta[name="viewport"]'),
-    language: document.documentElement.getAttribute('lang') || null,
-    iconLinks,
-    hasMapEmbed: !!document.querySelector('iframe[src*="google.com/maps"], iframe[src*="maps.google"]'),
-    inlineAnalytics: /gtag\(|GoogleAnalyticsObject|googletagmanager|fbq\(|clarity\(|_gaq/.test(document.documentElement.innerHTML.slice(0, 400000)),
-    jqueryVersion: (window.jQuery && window.jQuery.fn && window.jQuery.fn.jquery) || null,
-  };
-
-  const textNodes = [];
-  let order = 0;
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  while (walker.nextNode()) {
-    const node = walker.currentNode;
-    const txt = node.textContent.replace(/\s+/g, ' ').trim();
-    if (!txt || txt.length < 2) continue;
-    const el = node.parentElement;
-    if (!el || !visible(el)) continue;
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) continue;
-    order++;
-    textNodes.push({
-      text: txt.slice(0, 500),
-      selector: cssPath(el),
-      region: regionOf(el),
-      pageOrder: order,
-      aboveFold: r.top < vh,
-    });
-    if (textNodes.length > 400) break;
-  }
-
-  return { links, forms, buttons, structuredData, metadata, visibleText: textNodes };
-}
+// The in-page extractor now lives in capture/extract.mjs and is shared with
+// the crawl worker. SCAN_CAPABILITIES reproduces exactly what this file used
+// to extract on its own: no images, blocks, readable text or a11y tree, and
+// visible text capped at 400 nodes without bounding boxes.
 
 // ---------- mobile layout metrics (runs in browser, mobile viewport) ----------
 function mobileMetricsInPage() {
@@ -464,7 +315,7 @@ async function scanSite(browser, cand, cfg, batchDir, log) {
         return e ? { responseMs: Math.round(e.responseEnd - e.startTime), domContentLoadedMs: Math.round(e.domContentLoadedEventEnd - e.startTime), loadMs: e.loadEventEnd > 0 ? Math.round(e.loadEventEnd - e.startTime) : null } : null;
       }).catch(() => null);
 
-      extracted = await page.evaluate(extractInPage);
+      extracted = await page.evaluate(extractInPage, SCAN_CAPABILITIES);
 
       const headerPick = (h) => ({
         'content-type': h['content-type'] || null,
@@ -564,18 +415,67 @@ async function scanSite(browser, cand, cfg, batchDir, log) {
   }
 }
 
-// ---------- batch orchestration ----------
-async function main() {
-  const args = parseArgs(process.argv);
-  if (!args.out) {
-    console.error('Usage: node scan.mjs --out <batch-dir> [--config <file>] [--concurrency N] [--only <slug>] [--force] [--max N]');
-    process.exit(2);
-  }
-  const cfg = await loadConfig(args.config);
-  if (args.concurrency) cfg.concurrency = args.concurrency;
-  const batchDir = path.resolve(args.out);
 
-  const { candidates } = JSON.parse(await readFile(path.join(batchDir, 'candidates.json'), 'utf8'));
+// ---------- batch orchestration ----------
+
+/**
+ * Run a batch scan.
+ *
+ * The candidate list arrives in the job spec rather than being read from
+ * candidates.json, but it is still written to candidates.json in the output
+ * directory — the downstream offline stages (signals.mjs, score.mjs) read that
+ * file, and the whole point of preserving the artefact tree is that they keep
+ * working unchanged.
+ *
+ * batch.json is kept as the resume record. A scan that is interrupted and
+ * retried skips sites that already reached a terminal outcome, so a restart
+ * costs minutes rather than starting the whole batch again.
+ */
+export async function runScan(spec, ctx = {}) {
+  const {
+    outDir,
+    defaults = {},
+    userAgent = 'Mozilla/5.0 (compatible; AtelyrCaptureBot/1.0; +https://atelyr.com/bot)',
+    signal,
+    onProgress = () => {},
+    politeness = null,
+    guardOpts = {},
+  } = ctx;
+
+  const cfg = { ...defaults, ...spec };
+  const batchDir = outDir;
+  await mkdir(batchDir, { recursive: true });
+
+  // Mirrored to logs/scan.log so the API's log endpoint behaves the same way
+  // for a scan as it does for a crawl.
+  const logLines = [];
+  const log = (m) => {
+    logLines.push(`[${new Date().toISOString()}] ${m}`);
+    onProgress({ type: 'log', message: m });
+  };
+  const flushLog = async () => {
+    await mkdir(path.join(batchDir, 'logs'), { recursive: true }).catch(() => {});
+    await writeFile(path.join(batchDir, 'logs', 'scan.log'), logLines.join('\n') + '\n').catch(() => {});
+  };
+  const checkAborted = () => {
+    if (signal?.aborted) throw new ScanAbortedError(signal.reason ?? 'cancelled');
+  };
+
+  // Validate and de-duplicate the candidate list up front. A malformed entry
+  // should fail fast, not surface as a mystery failure 40 sites in.
+  const seen = new Set();
+  const candidates = [];
+  for (const raw of spec.candidates ?? []) {
+    const url = typeof raw === 'string' ? raw : raw?.url;
+    if (!url) continue;
+    const entry = typeof raw === 'string' ? {} : raw;
+    const id = String(entry.slug || entry.id || slugFromUrl(url)).toLowerCase();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    candidates.push({ id, name: entry.name ?? id, url });
+  }
+  await writeFile(path.join(batchDir, 'candidates.json'), JSON.stringify({ candidates }, null, 2));
+
   let batch = { schemaVersion: '0.1', sites: {} };
   const batchPath = path.join(batchDir, 'batch.json');
   try { batch = JSON.parse(await readFile(batchPath, 'utf8')); } catch { /* fresh batch */ }
@@ -584,30 +484,65 @@ async function main() {
   let writeChain = Promise.resolve();
   const saveBatch = () => (writeChain = writeChain.then(() => writeFile(batchPath, JSON.stringify(batch, null, 2))));
 
-  let todo = candidates.filter((c) => {
-    if (args.only) return c.id === args.only;
-    if (args.force) return true;
+  const todo = candidates.filter((c) => {
+    if (spec.force) return true;
     const s = batch.sites[c.id];
     return !s || !['ok', 'dead', 'blocked'].includes(s.outcome);
   });
-  if (args.max) todo = todo.slice(0, args.max);
 
-  const log = (m) => console.log(`[${new Date().toISOString().slice(11, 19)}] ${m}`);
   log(`Scanning ${todo.length} of ${candidates.length} candidates (concurrency ${cfg.concurrency})`);
-  if (!todo.length) { log('Nothing to do (all scanned — use --force to rescan).'); return; }
+  if (!todo.length) {
+    log('Nothing to do (all scanned — use force to rescan).');
+    await flushLog();
+    return summarise(batch, candidates);
+  }
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser();
+  let completed = 0;
   try {
     let idx = 0;
     const worker = async () => {
       while (idx < todo.length) {
+        checkAborted();
         const cand = todo[idx++];
+
+        // Guard and robots are checked per site, not per batch: one bad
+        // candidate must not abort a 200-site scan, so a refusal becomes that
+        // site's outcome exactly as an unreachable host would.
+        const gate = await checkFrontierUrl(cand.url, guardOpts);
+        if (!gate.allowed) {
+          log(`${cand.id}: REFUSED ${gate.detail}`);
+          batch.sites[cand.id] = {
+            name: cand.name, url: cand.url, status: 'done', outcome: 'refused',
+            pages: 0, error: gate.detail, finishedAt: new Date().toISOString(),
+          };
+          saveBatch();
+          continue;
+        }
+
+        if (cfg.respectRobotsTxt && await robotsForbids(cand.url, cfg, userAgent)) {
+          log(`${cand.id}: SKIPPED (robots.txt disallows)`);
+          batch.sites[cand.id] = {
+            name: cand.name, url: cand.url, status: 'done', outcome: 'robots_disallow',
+            pages: 0, error: null, finishedAt: new Date().toISOString(),
+          };
+          saveBatch();
+          continue;
+        }
+
         batch.sites[cand.id] = { name: cand.name, url: cand.url, status: 'scanning', startedAt: new Date().toISOString() };
         saveBatch();
+
         let result;
         try {
-          result = await scanSite(browser, cand, cfg, batchDir, log);
+          if (politeness) await politeness.acquire(cand.url, signal);
+          try {
+            result = await scanSite(browser, cand, cfg, batchDir, log);
+          } finally {
+            if (politeness) politeness.release(cand.url);
+          }
         } catch (e) {
+          if (e instanceof ScanAbortedError) throw e;
           result = { outcome: 'error', error: String(e && e.message ? e.message : e).slice(0, 300) };
           log(`${cand.id}: ERROR ${result.error}`);
           const captureDir = path.join(batchDir, 'sites', cand.id, 'capture');
@@ -616,24 +551,61 @@ async function main() {
         }
         batch.sites[cand.id] = { ...batch.sites[cand.id], status: 'done', outcome: result.outcome, pages: result.pages || 0, error: result.error || null, finishedAt: new Date().toISOString() };
         saveBatch();
+        completed++;
+        onProgress({ type: 'progress', sitesScanned: completed, sitesTotal: todo.length, currentSite: cand.id });
       }
     };
     await Promise.all(Array.from({ length: Math.min(cfg.concurrency, todo.length) }, worker));
   } finally {
-    await browser.close();
+    await browser.close().catch(() => {});
     await writeChain;
+    // Flush in `finally` so an aborted or failed scan still leaves a readable
+    // log — that is exactly when someone needs it most.
+    await flushLog();
   }
 
-  const outcomes = {};
-  for (const s of Object.values(batch.sites)) outcomes[s.outcome] = (outcomes[s.outcome] || 0) + 1;
-  log(`Done. Outcomes: ${JSON.stringify(outcomes)}`);
-  log(`Next: node signals.mjs --out ${batchDir}`);
+  const summary = summarise(batch, candidates);
+  log(`Done. Outcomes: ${JSON.stringify(summary.outcomes)}`);
+  await flushLog();
+  return summary;
 }
 
-const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isDirectRun) {
-  main().catch((e) => {
-    console.error('FATAL', e);
-    process.exit(1);
-  });
+function summarise(batch, candidates) {
+  const outcomes = {};
+  for (const s of Object.values(batch.sites)) outcomes[s.outcome] = (outcomes[s.outcome] || 0) + 1;
+  return {
+    candidates: candidates.length,
+    outcomes,
+    sites: Object.entries(batch.sites).map(([id, s]) => ({
+      id, url: s.url, outcome: s.outcome, pages: s.pages ?? 0, error: s.error ?? null,
+    })),
+  };
+}
+
+/** Derive a stable site id from a URL when the caller does not supply one. */
+function slugFromUrl(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '');
+  } catch {
+    return url.replace(/[^a-z0-9]+/gi, '-').slice(0, 60);
+  }
+}
+
+/**
+ * robots.txt check for a candidate's home page. Fetched per site because a
+ * batch spans many hosts; a fetch failure is treated as "not disallowed",
+ * matching how the crawl path treats a missing robots.txt.
+ */
+async function robotsForbids(url, cfg, userAgent) {
+  try {
+    const origin = new URL(url).origin;
+    const { robots } = await loadRobots(origin, {
+      respect: true,
+      timeoutMs: cfg.probeTimeoutMs ?? 15000,
+      userAgent,
+    });
+    return makeRobotsBlocker(robots, true)(url);
+  } catch {
+    return false;
+  }
 }

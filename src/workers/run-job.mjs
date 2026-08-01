@@ -16,6 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runCrawl, CrawlAbortedError } from './crawl.mjs';
+import { runScan, ScanAbortedError } from './scan.mjs';
 import { PolitenessGate } from '../jobs/politeness.mjs';
 import { BlockedUrlError } from '../net/guard.mjs';
 
@@ -57,7 +58,6 @@ async function main() {
 
   const ctx = {
     outDir,
-    defaults: defaults.crawl,
     userAgent: defaults.server.userAgent,
     signal: controller.signal,
     politeness,
@@ -66,8 +66,13 @@ async function main() {
 
   switch (job.kind) {
     case 'crawl': {
-      const result = await runCrawl(job.spec, ctx);
+      const result = await runCrawl(job.spec, { ...ctx, defaults: defaults.crawl });
       emit({ type: 'result', result: summariseCrawl(result) });
+      return 0;
+    }
+    case 'scan': {
+      const result = await runScan(job.spec, { ...ctx, defaults: defaults.scan });
+      emit({ type: 'result', result });
       return 0;
     }
     default: {
@@ -102,7 +107,7 @@ function summariseCrawl(index) {
 main()
   .then((code) => process.exit(code))
   .catch((err) => {
-    if (err instanceof CrawlAbortedError) {
+    if (err instanceof CrawlAbortedError || err instanceof ScanAbortedError) {
       emit({ type: 'error', error: { code: 'aborted', message: err.message } });
       process.exit(3);
     }

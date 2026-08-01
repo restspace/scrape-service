@@ -163,8 +163,52 @@ test('log endpoint returns empty text for a job that has not started', async () 
   assert.equal(await res.text(), '');
 });
 
+test('creates a scan job from a candidate list', async () => {
+  const res = await post('/scans', {
+    candidates: [{ url: 'https://example.com/', name: 'Example', slug: 'example' }],
+    concurrency: 2,
+  });
+  assert.equal(res.status, 202);
+  const job = await res.json();
+  assert.equal(job.kind, 'scan');
+  assert.equal(job.spec.candidates.length, 1);
+  assert.equal(job.spec.concurrency, 2);
+});
+
+test('accepts bare URL strings as candidates', async () => {
+  const res = await post('/scans', { candidates: ['https://example.com/bare'] });
+  assert.equal(res.status, 202);
+  assert.equal((await res.json()).spec.candidates[0].url, 'https://example.com/bare');
+});
+
+test('rejects an empty or oversized candidate list', async () => {
+  assert.equal((await (await post('/scans', { candidates: [] })).json()).error.code, 'field_required');
+  const many = Array.from({ length: 501 }, (_, i) => `https://example.com/${i}`);
+  const res = await post('/scans', { candidates: many });
+  assert.equal((await res.json()).error.code, 'field_exceeds_ceiling');
+});
+
+test('rejects a path-shaped candidate slug', async () => {
+  // Slugs become directory names under the artefact root.
+  const res = await post('/scans', { candidates: [{ url: 'https://example.com/', slug: '../../etc' }] });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error.code, 'field_invalid');
+});
+
+test('rejects a scan where no candidate is fetchable', async () => {
+  const res = await post('/scans', { candidates: ['http://127.0.0.1/', 'http://192.168.0.1/'] });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error.field, 'candidates');
+});
+
+test('accepts a scan where only some candidates are bad', async () => {
+  // One poisoned entry must not reject a batch; the worker records it per site.
+  const res = await post('/scans', { candidates: ['http://127.0.0.1/', 'https://example.com/mixed'] });
+  assert.equal(res.status, 202);
+});
+
 test('unimplemented kinds are an explicit 501, not a silent failure', async () => {
-  const res = await post('/scans', { candidates: [] });
+  const res = await post('/shots', { url: 'https://example.com/' });
   assert.equal(res.status, 501);
   assert.equal((await res.json()).error.code, 'not_implemented');
 });

@@ -19,19 +19,37 @@ export const FULL_CAPABILITIES = {
   blocks: true,
   readable: true,
   accessibilityTree: true,
+  visibleTextLimit: 600,
+  visibleTextBoundingBox: true,
 };
 
-/** What a shallow scan needs: enough to score a site, none of the heavy trees. */
+/**
+ * What a shallow scan needs: enough to score a site, none of the heavy trees.
+ *
+ * The two numeric differences are not arbitrary — the scan's copy of this
+ * extractor capped visible text at 400 nodes and omitted bounding boxes. Those
+ * are carried here deliberately so unifying the two copies does not silently
+ * change the artefacts `signals.mjs` reads downstream.
+ */
 export const SCAN_CAPABILITIES = {
   images: false,
   blocks: false,
   readable: false,
   accessibilityTree: false,
+  visibleTextLimit: 400,
+  visibleTextBoundingBox: false,
 };
 
 export function extractInPage(caps) {
   const want = Object.assign(
-    { images: true, blocks: true, readable: true, accessibilityTree: true },
+    {
+      images: true,
+      blocks: true,
+      readable: true,
+      accessibilityTree: true,
+      visibleTextLimit: 600,
+      visibleTextBoundingBox: true,
+    },
     caps || {},
   );
 
@@ -286,15 +304,20 @@ export function extractInPage(caps) {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) continue;
     order++;
-    textNodes.push({
+    // boundingBox is appended last so the serialised key order matches what the
+    // original crawler wrote — these files are compared byte-for-byte.
+    const entry = {
       text: txt.slice(0, 500),
       selector: cssPath(el),
       region: regionOf(el),
       pageOrder: order,
       aboveFold: r.top < vh,
-      boundingBox: { x: Math.round(r.x), y: Math.round(r.y + window.scrollY), width: Math.round(r.width), height: Math.round(r.height) },
-    });
-    if (textNodes.length > 600) break;
+    };
+    if (want.visibleTextBoundingBox) {
+      entry.boundingBox = { x: Math.round(r.x), y: Math.round(r.y + window.scrollY), width: Math.round(r.width), height: Math.round(r.height) };
+    }
+    textNodes.push(entry);
+    if (textNodes.length > want.visibleTextLimit) break;
   }
 
   // candidate blocks: semantic sections + heading-led containers
