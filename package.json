@@ -14,7 +14,9 @@
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
     "test": "node --test",
-    "parity": "node tools/parity.mjs"
+    "parity": "node tools/parity.mjs",
+    "parity:record": "node tools/parity.mjs --record",
+    "smoke": "node tools/smoke.mjs"
   },
   "dependencies": {
     "playwright": "^1.61.0"

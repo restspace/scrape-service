@@ -1,16 +1,19 @@
 #!/usr/bin/env node
-// Parity check: does the ported crawler still produce what the original did?
+// Parity check: does a change to the capture code alter what it extracts?
 //
-// The fixtures in test/fixtures/golden were captured with the pipeline's
-// crawl.mjs immediately before the code moved. This re-crawls the same sites
-// through the ported worker and compares the trees.
+// Record a baseline, change something, compare. The comparison covers page
+// slugs, per-page counts, skipped reasons, artefact file presence,
+// asset-manifest size, and the crawl index's structural fields.
 //
-// What is compared: page slugs, per-page counts, skipped reasons, artefact file
-// presence, asset-manifest size, and the crawl index's structural fields.
 // What is deliberately NOT compared: timestamps, crawlDate, PNG bytes, and the
 // exact text of live pages — the sites are real and change under us. A count
-// that moves by a page's worth of content is a site edit; a count that moves to
-// zero, or a slug that disappears, is a regression.
+// that drifts by a page's worth of content is a site edit; a count that drops
+// to zero, or a slug that disappears, is a regression.
+//
+// Neither the baseline nor the site list is committed. Both are captures of, or
+// pointers to, third-party business websites, and this is a public repository.
+// `test/parity-sites.example.json` shows the format; copy it to
+// `test/parity-sites.json` and put your own sites in it.
 //
 // This lives in tools/ rather than test/ on purpose: Node treats every file
 // under a `test/` directory as a unit test, and this one drives real browsers
@@ -18,9 +21,11 @@
 // (`npm run parity`), never as part of `npm test`.
 //
 // Usage:
+//   node tools/parity.mjs --record                    # capture the baseline
+//   node tools/parity.mjs                             # compare against it
 //   node tools/parity.mjs [--fixture <slug>] [--tolerance 0.15] [--out <dir>]
 
-import { readFile, readdir, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -31,6 +36,7 @@ import { runCrawl } from '../src/workers/crawl.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.join(here, '..');
 const FIXTURE_ROOT = path.join(REPO_ROOT, 'test', 'fixtures', 'golden');
+const SITES_FILE = path.join(REPO_ROOT, 'test', 'parity-sites.json');
 
 const args = process.argv.slice(2);
 const opt = {};
@@ -43,6 +49,27 @@ for (let i = 0; i < args.length; i++) {
   }
 }
 const TOLERANCE = Number(opt.tolerance ?? 0.15);
+
+/**
+ * The sites to crawl, from a local (gitignored) file. Kept out of the repo
+ * because a list of real businesses' URLs is not ours to publish, even without
+ * their content attached.
+ */
+async function loadSites() {
+  try {
+    return JSON.parse(await readFile(SITES_FILE, 'utf8')).sites;
+  } catch {
+    console.error(`No site list at ${SITES_FILE}.`);
+    console.error('');
+    console.error('Copy the example and edit it to point at sites you are entitled to crawl:');
+    console.error('  cp test/parity-sites.example.json test/parity-sites.json');
+    console.error('');
+    console.error('Pick a spread that exercises the crawler: one small site that fits under');
+    console.error('the page cap, one large enough to be truncated by it (which tests the');
+    console.error('tiered frontier), and one with neither robots.txt nor a sitemap.');
+    process.exit(2);
+  }
+}
 
 const PER_PAGE_FILES = [
   'metadata.json', 'headings.json', 'links.json', 'images.json', 'forms.json',
@@ -137,13 +164,70 @@ async function compare(slug, fixtureDir, freshDir) {
   return { fails, warns };
 }
 
+/**
+ * Capture a baseline for each configured site.
+ *
+ * Fixtures are generated locally rather than committed: they are full captures
+ * of third-party business websites, which is not something to publish in a
+ * public repository. The trade-off is that a fresh clone has no baseline until
+ * it makes one, so the first run records rather than compares.
+ *
+ * That still catches what matters. The regression this guards against is a
+ * change to the capture code altering what it extracts — so a baseline taken
+ * before your change and compared after it is exactly the right test, and is
+ * what `--record` then `npm run parity` gives you.
+ */
+async function record(sites) {
+  const defaults = JSON.parse(await readFile(path.join(REPO_ROOT, 'config', 'defaults.json'), 'utf8')).crawl;
+  await mkdir(FIXTURE_ROOT, { recursive: true });
+
+  for (const site of sites) {
+    const slug = site.slug;
+    process.stdout.write(`\n=== ${slug} — recording baseline from ${site.rootUrl} (maxPages=${site.maxPages})\n`);
+    await rm(path.join(FIXTURE_ROOT, slug), { recursive: true, force: true });
+    await runCrawl(
+      { rootUrl: site.rootUrl, maxPages: site.maxPages },
+      {
+        outDir: path.join(FIXTURE_ROOT, slug),
+        defaults,
+        onProgress: (e) => { if (e.type === 'log') process.stdout.write(`  ${e.message}\n`); },
+      },
+    );
+  }
+  console.log(`\nBaseline recorded at ${FIXTURE_ROOT}`);
+  console.log('It is gitignored on purpose — it holds captured third-party site content.');
+  console.log('Re-run `npm run parity` after a code change to compare against it.');
+}
+
 async function main() {
-  const fixtures = opt.fixture
-    ? [opt.fixture]
-    : (await readdir(FIXTURE_ROOT, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name);
+  if (opt.record) {
+    let sites = await loadSites();
+    if (opt.fixture) sites = sites.filter((s) => s.slug === opt.fixture);
+    if (!sites.length) {
+      console.error(opt.fixture ? `no site with slug '${opt.fixture}'` : 'site list is empty');
+      process.exit(2);
+    }
+    await record(sites);
+    return;
+  }
+
+  let fixtures = [];
+  try {
+    fixtures = (await readdir(FIXTURE_ROOT, { withFileTypes: true }))
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch { /* no baseline yet */ }
+  if (opt.fixture) fixtures = fixtures.filter((f) => f === opt.fixture);
 
   if (!fixtures.length) {
-    console.error(`no fixtures under ${FIXTURE_ROOT}`);
+    console.error(`No baseline under ${FIXTURE_ROOT}.`);
+    console.error('');
+    console.error('Fixtures are not committed — they are captures of third-party websites.');
+    console.error('Record a baseline first (this crawls real sites and takes a few minutes):');
+    console.error('');
+    console.error('  npm run parity:record');
+    console.error('');
+    console.error('Then re-run `npm run parity` after changing capture code to compare.');
     process.exit(2);
   }
 

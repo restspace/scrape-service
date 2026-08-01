@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy to parity-sites.json (gitignored) and replace with sites you are entitled to crawl. Pick a spread that exercises different code paths rather than three similar sites: one small enough that the whole site fits under maxPages (fully deterministic), one large enough to be truncated by it (which is what tests the tiered frontier's promote-and-requeue), and one with neither robots.txt nor a sitemap (which tests the fallback discovery path).",
+
+  "sites": [
+    {
+      "slug": "small-complete-site",
+      "rootUrl": "https://example.com/",
+      "maxPages": 8,
+      "why": "fewer pages than the cap — the whole site is captured, so the result is deterministic"
+    },
+    {
+      "slug": "large-truncated-site",
+      "rootUrl": "https://example.org/",
+      "maxPages": 8,
+      "why": "far more pages than the cap, ideally with a big sitemap — exercises the tiered frontier"
+    },
+    {
+      "slug": "no-robots-no-sitemap",
+      "rootUrl": "https://example.net/",
+      "maxPages": 8,
+      "why": "no robots.txt and no sitemap.xml — exercises the fallback discovery path"
+    }
+  ]
+}

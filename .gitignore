@@ -6,9 +6,12 @@ node_modules/
 /artefacts/
 *.log
 
-# Parity fixtures keep their JSON but never their screenshots (see
-# test/fixtures/README.md) — this is the backstop if one slips through.
-test/fixtures/**/*.png
+# Parity baselines are full captures of third-party business websites, and the
+# site list points at real businesses. Neither belongs in a public repository —
+# generate them locally with `npm run parity:record`. See
+# test/parity-sites.example.json.
+test/fixtures/
+test/parity-sites.json
 
 .DS_Store
 Thumbs.db
