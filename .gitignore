@@ -1,0 +1,14 @@
+node_modules/
+
+# Runtime state — job records and captured artefacts. Never committed; the
+# server writes these into ARTEFACT_ROOT (in production, RS2's fileRoot).
+/var/
+/artefacts/
+*.log
+
+# Parity fixtures keep their JSON but never their screenshots (see
+# test/fixtures/README.md) — this is the backstop if one slips through.
+test/fixtures/**/*.png
+
+.DS_Store
+Thumbs.db

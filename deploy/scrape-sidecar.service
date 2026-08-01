@@ -1,0 +1,55 @@
+# systemd unit for the browser capture sidecar.
+#
+# Install:
+#   sudo cp deploy/scrape-sidecar.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now scrape-sidecar
+#
+# ARTEFACT_ROOT must be the directory the RS2 `/scrape-runs` file mount serves
+# (RS2's fileRoot + the mount's store.root, e.g. /srv/rs2/data/.rs2-scrape).
+# The sidecar writes artefacts there directly; RS2 only ever reads them.
+
+[Unit]
+Description=Browser capture sidecar (crawl/scan/screenshot API)
+Documentation=https://github.com/atelyr/scrape-service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scrape
+Group=scrape
+WorkingDirectory=/opt/scrape-service
+ExecStart=/usr/bin/node src/server.mjs
+
+# HOST is not configurable in practice: this process must never be publicly
+# reachable. RS2 is the only ingress, and it reaches us over loopback.
+Environment=HOST=127.0.0.1
+Environment=PORT=8081
+Environment=ARTEFACT_ROOT=/srv/rs2/data/.rs2-scrape
+Environment=JOB_ROOT=/var/lib/scrape-service/jobs
+# Start conservative: this box also serves client sites, and each chromium
+# context costs 150-300 MB. Raise only after measuring under real load.
+Environment=CONCURRENT_JOBS=2
+
+Restart=always
+RestartSec=5s
+# A crash loop usually means chromium cannot launch (missing system libs after
+# an OS upgrade). Give up rather than thrash, so it shows up in status.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# Chromium needs a writable temp dir and its own sandbox; PrivateTmp gives it
+# one without exposing the host's.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/rs2/data/.rs2-scrape /var/lib/scrape-service
+# Chromium's own sandbox needs user namespaces; do not set RestrictNamespaces.
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=scrape-sidecar
+
+[Install]
+WantedBy=multi-user.target

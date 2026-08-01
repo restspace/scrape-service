@@ -1,0 +1,22 @@
+{
+  "name": "scrape-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser capture API — deep site crawl, batch shallow scan and screenshots. Runs as a loopback-only sidecar behind an RS2 proxy mount.",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "scrape-service": "./src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "test": "node --test",
+    "parity": "node tools/parity.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.61.0"
+  }
+}

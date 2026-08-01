@@ -1,0 +1,70 @@
+{
+  "_comment": "Merged defaults for both capture workers. `crawl` came from DEFAULTS in the pipeline's crawl.mjs; `scan` from scan-config.default.json. `server` and `limits` are new — they exist because this now runs as a shared service rather than a one-shot CLI on a trusted machine.",
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8081,
+    "artefactRoot": "./var/artefacts",
+    "jobRoot": "./var/jobs",
+    "userAgent": "Mozilla/5.0 (compatible; AtelyrCaptureBot/1.0; +https://atelyr.com/bot)",
+    "concurrentJobs": 2,
+    "dedupeWindowMs": 900000
+  },
+
+  "limits": {
+    "_comment": "Hard server-side ceilings. A request may ask for less, never more; exceeding one fails the job with a typed error rather than silently clamping.",
+    "maxPagesCeiling": 200,
+    "crawlWallClockMs": 900000,
+    "scanWallClockMs": 3600000,
+    "shotWallClockMs": 120000,
+    "artefactBytesPerJob": 2147483648,
+    "maxCandidatesPerScan": 500,
+    "_allowRobotsOverride": "When false, a request may not set respectRobotsTxt:false. Locally that flag was a convenience on sites we had permission to rebuild; exposed as an API it becomes a way for any caller to make this server ignore robots.txt, so it is off by default and turning it on is a deliberate operator decision.",
+    "allowRobotsOverride": false
+  },
+
+  "politeness": {
+    "_comment": "Per-registrable-domain token bucket shared across all jobs, so two concurrent jobs can never hammer one host. Did not exist locally, where crawls were sequential and hand-picked.",
+    "minIntervalMsPerDomain": 800,
+    "maxConcurrentPerDomain": 1
+  },
+
+  "gc": {
+    "ttlDays": 14,
+    "sweepIntervalMs": 3600000,
+    "diskHighWaterPct": 85
+  },
+
+  "crawl": {
+    "maxPages": 50,
+    "respectRobotsTxt": true,
+    "includeExternalAssets": false,
+    "captureMobile": true,
+    "captureDesktop": true,
+    "businessCategoryHint": null,
+    "targetMarket": null,
+    "crawlDepth": 3,
+    "allowedDomains": [],
+    "excludedPathPatterns": [
+      "/wp-admin",
+      "/cart",
+      "/checkout",
+      "/login",
+      "/wp-login",
+      "/my-account",
+      "/basket"
+    ],
+    "timeoutMs": 30000,
+    "navWaitUntil": "networkidle"
+  },
+
+  "scan": {
+    "_comment": "respectRobotsTxt is true here where the original scan.mjs had no robots handling at all — a deliberate change for server-side operation.",
+    "concurrency": 4,
+    "maxPagesPerSite": 4,
+    "siteBudgetMs": 90000,
+    "settleMs": 800,
+    "respectRobotsTxt": true,
+    "ignoreHTTPSErrors": true
+  }
+}
