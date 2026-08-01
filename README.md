@@ -83,12 +83,29 @@ which is what lets the pipeline consume it unchanged.
 
 ## Parity
 
-`test/fixtures/golden/` holds trees captured from the original `crawl.mjs`
-immediately before the move, with provenance recorded in
-`FIXTURE-PROVENANCE.txt`. `npm run parity` re-crawls the same sites and diffs
-structure, slugs, counts and skipped reasons — ignoring timestamps, `crawlDate`
-and PNG bytes. This is the regression test for the move and for everything
-after it.
+The regression this guards against is a code change silently altering what the
+crawler extracts — a count quietly dropping to zero, a page slug disappearing.
+So: record a baseline, change something, compare.
+
+```bash
+cp test/parity-sites.example.json test/parity-sites.json   # point it at your sites
+npm run parity:record                                       # capture a baseline
+# ... change capture code ...
+npm run parity                                              # compare
+```
+
+It diffs structure, slugs, counts, skipped reasons and artefact presence, and
+ignores timestamps, `crawlDate` and PNG bytes. Drift on live sites is reported
+separately from failures, because real sites change under you.
+
+**Neither the baseline nor the site list is committed** — they are captures of,
+and pointers to, third-party business websites, and this repository is public.
+Both are gitignored; generate them locally.
+
+Choose sites that exercise different paths rather than three similar ones: one
+small enough to fit under the page cap, one large enough to be truncated by it
+(which is what tests the tiered frontier), and one with neither robots.txt nor a
+sitemap.
 
 ## Operational notes
 

@@ -271,16 +271,20 @@ sudo systemctl restart scrape-sidecar
 free -h
 ```
 
-**Optional but recommended: the parity suite.** The repo ships golden fixtures
-captured from the original crawler before the code moved. Running them here
-proves this host's Chromium behaves like the one the fixtures came from:
+**Optional: the parity suite.** Baselines are not committed (they are captures
+of third-party sites), so this only helps if you have a site list to point it
+at. If you do, it is a good way to confirm this host's Chromium behaves like the
+machine the code was developed on:
 
 ```bash
-sudo -u scrape npm run parity        # ~15 min, crawls 3 real sites
+cp test/parity-sites.example.json test/parity-sites.json   # edit to real sites
+sudo -u scrape npm run parity:record                        # ~15 min
 ```
 
-Expect `PARITY OK — 3 fixture(s)`. Drift notes are informational (live sites
-change); failures are not.
+Recording alone proves the crawler works end to end here. To compare against the
+development machine's numbers, ask for its baseline rather than re-deriving one.
+Skip this if you have no site list — `tools/smoke.mjs` in step 4 already covers
+"does capture work on this host".
 
 ---
 
