@@ -70,16 +70,30 @@ later step depends on them:
 # 1. Where is RS2's serverConfig.json?
 find / -name serverConfig.json -not -path '*/node_modules/*' 2>/dev/null
 
-# 2. From it: fileRoot (artefacts live under this) and tenantsDir
+# 2. From it: fileRoot, tenancy mode, and tenantsDir
 cat <path>/serverConfig.json
 
 # 3. Which tenant serves rapiderit.com, and what does it already mount?
 ls <tenantsDir>/ && cat <tenantsDir>/<tenant>.json
+
+# 4. Where a mount's `store.root` ACTUALLY resolves. Do not infer this from
+#    fileRoot — in multi-tenant mode RS2 inserts the tenant name. Read it off a
+#    mount that already works, e.g. the /sites mount's root:
+ls <fileRoot>/ && ls <fileRoot>/<tenant>/
 ```
 
 Record: `RS2_DIR`, `FILE_ROOT` (resolved absolute — relative paths in
 serverConfig resolve against the serverConfig's own directory, **not** cwd),
 `TENANT_FILE`, and the user RS2 runs as.
+
+**`ARTEFACT_BASE` is the one you will get wrong.** A file mount's `store.root`
+is relative to the tenant's file root, which is `fileRoot` only when
+`tenancy.mode` is `single`. Under `mode: "multi"` it is
+`<fileRoot>/<tenant>/`. Put the artefacts one level too high and everything
+still looks installed — the mount registers, `/health` is fine, crawls succeed
+and write files — but every artefact URL 404s with `directory does not exist`.
+Set `ARTEFACT_BASE` to whichever directory the existing `.rs2-sites` /`home`
+directories live in, and use it everywhere this doc says `<ARTEFACT_BASE>`.
 
 ---
 
@@ -127,14 +141,32 @@ directory the RS2 `/scrape-runs` file mount will serve** — that is the whole
 point of the shared-disk design, and nothing is copied or uploaded:
 
 ```bash
-sudo mkdir -p "$FILE_ROOT/.rs2-scrape" /var/lib/scrape-service/jobs
-sudo chown -R scrape:scrape "$FILE_ROOT/.rs2-scrape" /var/lib/scrape-service
+sudo mkdir -p "$ARTEFACT_BASE/.rs2-scrape" /var/lib/scrape-service/jobs
+sudo chown -R scrape:scrape "$ARTEFACT_BASE/.rs2-scrape" /var/lib/scrape-service
 
 # RS2 must be able to READ what the sidecar writes. If RS2 runs as a different
 # user, add it to the scrape group rather than making anything world-readable:
 sudo usermod -a -G scrape <rs2-user>
-sudo chmod 750 "$FILE_ROOT/.rs2-scrape"
+sudo chmod 750 "$ARTEFACT_BASE/.rs2-scrape"
 ```
+
+If RS2's own data directory is mode 700 and holds other tenants' data, do not
+loosen it to let the browser process write there. Keep the artefacts in a
+scrape-owned directory and bind-mount them into place — the mount point is what
+RS2 reads, and the sidecar never gets a handle on anything else:
+
+```bash
+sudo mkdir -p /var/lib/scrape-service/artefacts "$ARTEFACT_BASE/.rs2-scrape"
+sudo chown scrape:scrape /var/lib/scrape-service/artefacts
+sudo mount --bind /var/lib/scrape-service/artefacts "$ARTEFACT_BASE/.rs2-scrape"
+echo "/var/lib/scrape-service/artefacts $ARTEFACT_BASE/.rs2-scrape none bind 0 0" \
+  | sudo tee -a /etc/fstab
+sudo findmnt --verify --fstab   # must be 0 errors, or the next boot loses it
+sudo systemctl daemon-reload    # systemd caches fstab
+```
+
+Then set `ARTEFACT_ROOT` in the unit to the **source** directory
+(`/var/lib/scrape-service/artefacts`), not the mount point.
 
 Install the unit from `deploy/scrape-sidecar.service`, **editing the paths and
 the sizing environment to match what you discovered**:
@@ -142,7 +174,7 @@ the sizing environment to match what you discovered**:
 ```ini
 Environment=HOST=127.0.0.1
 Environment=PORT=8081
-Environment=ARTEFACT_ROOT=<FILE_ROOT>/.rs2-scrape
+Environment=ARTEFACT_ROOT=<ARTEFACT_BASE>/.rs2-scrape
 Environment=JOB_ROOT=/var/lib/scrape-service/jobs
 Environment=CONCURRENT_JOBS=1
 Environment=ARTEFACT_TTL_DAYS=7
@@ -151,8 +183,9 @@ Environment=ARTEFACT_BYTES_PER_JOB=1073741824
 Environment=MAX_PAGES_CEILING=120
 ```
 
-`ReadWritePaths` in the unit must list both `<FILE_ROOT>/.rs2-scrape` and
+`ReadWritePaths` in the unit must list whatever `ARTEFACT_ROOT` points at and
 `/var/lib/scrape-service`, or `ProtectSystem=strict` will make every write fail.
+(With the bind-mount layout above, `/var/lib/scrape-service` alone covers both.)
 
 ```bash
 sudo cp deploy/scrape-sidecar.service /etc/systemd/system/
@@ -224,8 +257,14 @@ Notes that will bite if ignored:
   root and also tolerates the `/scrape` prefix.
 - The file mount is **read-only on purpose**. The sidecar writes via the
   filesystem; RS2 never writes there.
-- `store.root` is relative to `fileRoot`, matching the existing `/html` mount's
-  pattern.
+- `store.root` is relative to the **tenant's** file root (`<fileRoot>/<tenant>/`
+  under `tenancy.mode: "multi"`), matching the existing `/html` mount's pattern.
+  Confirm it immediately: `GET /scrape-runs/` must return a `dir+json` listing.
+  A `not_found` with `"directory does not exist"` means the artefacts are not
+  under the tenant's file root — see section 1. Nothing else in the deployment
+  reveals this, because the sidecar's own
+  `/scrape/crawls/<id>/artefacts/<path>` route reads the disk directly and keeps
+  working regardless.
 
 ---
 
@@ -259,9 +298,16 @@ done
 curl -s -X POST https://rapiderit.com/scrape/crawls \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"rootUrl":"https://example.com/","maxPages":3}' | jq
-# poll until succeeded, then:
+# poll until succeeded, then read the artefacts back THROUGH THE FILE MOUNT —
+# not through /scrape/crawls/<id>/artefacts, which bypasses it and would pass
+# even with the artefact root in the wrong place:
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://rapiderit.com/scrape-runs/ | jq            # must list the job dir
 curl -s -H "Authorization: Bearer $TOKEN" \
   https://rapiderit.com/scrape-runs/<jobId>/crawl.json | jq '.crawl'
+# and a nested binary artefact, to prove traversal and content-type:
+curl -s -o /dev/null -w '%{http_code} %{content_type}\n' -H "Authorization: Bearer $TOKEN" \
+  https://rapiderit.com/scrape-runs/<jobId>/pages/home/screenshot-desktop.png
 
 # 6. Ceilings error rather than clamp
 curl -s -X POST https://rapiderit.com/scrape/crawls \
@@ -306,6 +352,8 @@ Skip this if you have no site list — `tools/smoke.mjs` in step 4 already cover
 | Jobs fail `artefact_cap_exceeded` | Working as designed: a crawl exceeded 1 GB of artefacts and was killed. Reduce `maxPages` for that site rather than raising the cap. |
 | `capability_denied` from RS2 | The proxy mount's `target` is wrong, or you added an `httpOut` grant it does not need — a `proxy` mount's `target` *is* its allowlist. |
 | 404 through RS2, 200 on loopback | Prefix confusion. RS2 strips `/scrape`; confirm the mount `path` and that you are calling `/scrape/crawls`, not `/scrape/scrape/crawls`. |
+| Mount registers but every path 404s `directory does not exist` | The tenant config was edited on disk without a reload — RS2 rebuilds tenants lazily, so the mount is in `GET /services/raw` but absent from `/.well-known/rs2/services`. A no-op `GET → PUT /services/raw` with `If-Match` hot-swaps it in; no `rs2` restart. |
+| `/scrape-runs` 404s `directory does not exist` but crawls succeed | The artefact root is not under the **tenant's** file root. Under `tenancy.mode: "multi"` that is `<fileRoot>/<tenant>/`, not `<fileRoot>/`. Compare against where `.rs2-sites` lives and move the directory (or its bind mount) there. `store.root` cannot escape upward — `../` is rejected as `path_unsafe`. |
 | Disk filling anyway | Check GC is running: `journalctl -u scrape-sidecar | grep gc:`. It logs when it evicts and when it *cannot* ("nothing evictable"). |
 
 **Rollback is clean** — nothing here modifies RS2's existing behaviour:
