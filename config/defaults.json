@@ -59,12 +59,34 @@
   },
 
   "scan": {
-    "_comment": "respectRobotsTxt is true here where the original scan.mjs had no robots handling at all — a deliberate change for server-side operation.",
+    "_comment": "respectRobotsTxt is true here where the original scan.mjs had no robots handling at all — a deliberate change for server-side operation. Every other value is the pipeline's scan-config.default.json verbatim: scan.mjs reads these directly off cfg with no fallbacks, so a missing key is not a smaller default, it is undefined behaviour. See the guard in test/config.test.mjs.",
     "concurrency": 4,
     "maxPagesPerSite": 4,
     "siteBudgetMs": 90000,
     "settleMs": 800,
     "respectRobotsTxt": true,
-    "ignoreHTTPSErrors": true
+    "ignoreHTTPSErrors": true,
+    "pageTimeoutMs": 20000,
+    "probeTimeoutMs": 12000,
+    "linkCheckSample": 15,
+    "linkCheckTimeoutMs": 8000,
+    "desktopViewport": { "width": 1366, "height": 900 },
+    "mobileViewport": { "width": 390, "height": 844 },
+    "pagePatterns": [
+      { "group": "contact", "pattern": "contact|get-in-touch|getintouch|find-us|enquir" },
+      { "group": "about", "pattern": "about|team|who-we-are|people|meet|our-firm|staff" },
+      { "group": "services", "pattern": "service|practice-area|what-we-do|expertise|sector|accounting|tax" }
+    ],
+    "analyticsHosts": [
+      "google-analytics.com",
+      "googletagmanager.com",
+      "analytics.google.com",
+      "connect.facebook.net",
+      "clarity.ms",
+      "plausible.io",
+      "matomo",
+      "stats.g.doubleclick.net",
+      "hotjar.com"
+    ]
   }
 }

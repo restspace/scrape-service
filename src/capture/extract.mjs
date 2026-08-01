@@ -289,6 +289,17 @@ export function extractInPage(caps) {
     language: document.documentElement.getAttribute('lang') || null,
     openGraph: og,
     twitterCard: tw,
+    // Declared icon links, for the scan path's favicon signal — "does the page
+    // declare an icon at all", which is a different question from whether
+    // /favicon.ico happens to resolve. `~=` matches the whitespace-separated
+    // token, so `rel="shortcut icon"` counts and `rel="apple-touch-icon"` does
+    // not, matching what signals.mjs records as its evidence.
+    //
+    // Appended last on purpose: the existing key order is what downstream
+    // consumers and the parity fixtures were written against.
+    iconLinks: [...document.querySelectorAll('link[rel~="icon"]')]
+      .map((l) => l.getAttribute('href'))
+      .filter(Boolean),
   };
 
   // visible text with order + fold + bbox
