@@ -167,6 +167,14 @@ export async function runCrawl(spec, ctx = {}) {
         const finalUrl = normalizeUrl(page.url(), rootOrigin);
         const contentType = resp ? (resp.headers()['content-type'] || '') : '';
 
+        // The frontier checks vetted the URL we asked for, not the one the
+        // browser landed on — an HTTP redirect can hop to any host.
+        if (!hostAllowed(finalUrl, cfg.allowedDomains)) {
+          skipped.push({ url, reason: 'offsite_redirect', finalUrl });
+          await page.close();
+          continue;
+        }
+
         if (!contentType.includes('html') && contentType) {
           skipped.push({ url, reason: 'non_html', contentType });
           await page.close();
@@ -176,6 +184,15 @@ export async function runCrawl(spec, ctx = {}) {
         // settle, then auto-scroll to trigger lazy-loaded images / intersection observers
         // (page builders defer team/hero photos until they scroll into view), then return to top
         const hadDelayedJs = await settlePage(page);
+
+        // JS and meta-refresh redirects fire while the page settles, so the
+        // host has to be re-checked before anything is captured from it.
+        const settledUrl = normalizeUrl(page.url(), rootOrigin);
+        if (!hostAllowed(settledUrl, cfg.allowedDomains)) {
+          skipped.push({ url, reason: 'offsite_redirect', finalUrl: settledUrl });
+          await page.close();
+          continue;
+        }
 
         const data = await page.evaluate(extractInPage, FULL_CAPABILITIES);
 
