@@ -48,6 +48,22 @@ export function resolveCrawlSpec(spec, defaults) {
   return cfg;
 }
 
+/**
+ * Delay a 429 asks for: the Retry-After header (delta-seconds or HTTP-date)
+ * when the server sent a usable one, else the caller's backoff — capped, so a
+ * hostile or broken header cannot stall a job for its whole wall clock.
+ */
+export function retryAfterMs(headers, fallbackMs, capMs = 60_000) {
+  const v = headers?.['retry-after'];
+  let ms = fallbackMs;
+  if (v !== undefined && v !== '') {
+    const secs = Number(v);
+    ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(v) - Date.now();
+    if (!Number.isFinite(ms) || ms < 0) ms = fallbackMs;
+  }
+  return Math.min(ms, capMs);
+}
+
 export async function runCrawl(spec, ctx = {}) {
   const {
     outDir,
@@ -130,7 +146,19 @@ export async function runCrawl(spec, ctx = {}) {
   const crawled = new Map(); // url -> page record
   const skipped = [];
   const usedSlugs = new Set();
+  const backoffsDone = new Map(); // url -> 429 backoffs already taken
   let discovered = queued.size;
+
+  // Resolves early on abort rather than rejecting, so callers follow it with
+  // checkAborted() and the abort surfaces as CrawlAbortedError like everywhere else.
+  const sleep = (ms) => new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (signal) {
+      const onAbort = () => { clearTimeout(t); resolve(); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 
   const browser = await launchBrowser();
   const desktop = await makeDesktopContext(browser, { userAgent });
@@ -139,7 +167,8 @@ export async function runCrawl(spec, ctx = {}) {
   try {
     while (queue.length && crawled.size < cfg.maxPages) {
       checkAborted();
-      const { url, depth } = dequeue();
+      const entry = dequeue();
+      const { url, depth } = entry;
       if (crawled.has(url)) continue;
       if (!hostAllowed(url, cfg.allowedDomains)) { skipped.push({ url, reason: 'offsite' }); continue; }
       if (pathExcluded(url, cfg.excludedPathPatterns)) { skipped.push({ url, reason: 'excluded_path' }); continue; }
@@ -172,6 +201,26 @@ export async function runCrawl(spec, ctx = {}) {
         if (!hostAllowed(finalUrl, cfg.allowedDomains)) {
           skipped.push({ url, reason: 'offsite_redirect', finalUrl });
           await page.close();
+          continue;
+        }
+
+        // 429 means "not now", not "here is the page" — back off and requeue
+        // rather than capturing the rate-limit interstitial as content. After
+        // cfg.rateLimitRetries backoffs the URL is recorded as skipped.
+        if (status === 429) {
+          const attempts = backoffsDone.get(url) ?? 0;
+          await page.close();
+          if (attempts >= cfg.rateLimitRetries) {
+            skipped.push({ url, reason: 'rate_limited', attempts });
+            continue;
+          }
+          backoffsDone.set(url, attempts + 1);
+          const delayMs = retryAfterMs(resp?.headers(), cfg.rateLimitBackoffMs * 2 ** attempts);
+          log(`  429 on ${url} — backing off ${(delayMs / 1000).toFixed(1)}s (retry ${attempts + 1}/${cfg.rateLimitRetries})`);
+          await sleep(delayMs);
+          checkAborted();
+          queue.push(entry);
+          queuedEntry.set(url, entry);
           continue;
         }
 

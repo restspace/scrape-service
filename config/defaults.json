@@ -55,7 +55,9 @@
       "/basket"
     ],
     "timeoutMs": 30000,
-    "navWaitUntil": "networkidle"
+    "navWaitUntil": "networkidle",
+    "rateLimitRetries": 3,
+    "rateLimitBackoffMs": 2000
   },
 
   "scan": {
