@@ -19,6 +19,8 @@
 // restarted scan pick up where it left off.
 
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { request as httpsRequest } from 'node:https';
+import { request as httpRequest } from 'node:http';
 import path from 'node:path';
 
 import { launchBrowser } from '../capture/browser.mjs';
@@ -77,6 +79,65 @@ async function followRedirects(startUrl, timeoutMs, maxHops = 5) {
   return { ok: false, finalUrl: current, finalStatus: 0, chain, error: 'too_many_redirects' };
 }
 
+// ---------- where does HTTPS actually land when the certificate is wrong? ----------
+// followRedirects() gives up at the TLS handshake, so a cert error records `cert_error` and an
+// empty chain: we learn the certificate is bad and nothing about what the visitor then sees.
+// That hid a materially worse defect than "no secure version". Gill Insurance served the HOST's
+// certificate (CN=www.sitewiz.co.uk) on 443 and then redirected twice to the web design agency's
+// own marketing site — so anyone whose browser prefers HTTPS, which Chrome now does by default,
+// landed on a different company. Every automated check we had fetched http:// and looked healthy;
+// only opening it in a real browser revealed it (2026-08-24).
+//
+// So on cert_error we repeat the follow with verification disabled, purely to observe the
+// destination. Nothing is captured from that response and browseUrl is unaffected — an insecure
+// endpoint never becomes the site we scan. It only answers "where would the visitor end up?".
+
+function headInsecure(url, timeoutMs) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(url); } catch { return resolve(null); }
+    const fn = u.protocol === 'https:' ? httpsRequest : httpRequest;
+    const req = fn(url, {
+      method: 'GET',
+      rejectUnauthorized: false,          // observation only — see the note above
+      headers: { 'user-agent': 'Mozilla/5.0 ProspectScanBot/1.0' },
+      timeout: timeoutMs,
+    }, (res) => {
+      res.resume();                        // discard the body; we only want status + location
+      resolve({ status: res.statusCode || 0, location: res.headers.location || null });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+// The registrable domain, near enough for "is this the same business?" — the last two labels,
+// or three for the common multi-part public suffixes we actually meet in UK/IE batches.
+const MULTI_PART_TLD = /\.(co|org|ac|gov|net|ltd|plc|me|sch)\.(uk|nz|za|il|in|jp|kr)$/i;
+export function registrableDomain(host) {
+  const h = String(host || '').toLowerCase().replace(/\.$/, '');
+  const parts = h.split('.');
+  const take = MULTI_PART_TLD.test(h) ? 3 : 2;
+  return parts.slice(-take).join('.');
+}
+
+async function httpsLandingAfterCertError(httpsUrl, timeoutMs, maxHops = 5) {
+  const chain = [];
+  let current = httpsUrl;
+  for (let hop = 0; hop <= maxHops; hop++) {
+    const res = await headInsecure(current, timeoutMs);
+    if (!res) return chain.length ? { finalUrl: current, chain, reachable: true } : null;
+    chain.push({ url: current, status: res.status });
+    if (res.status >= 300 && res.status < 400 && res.location) {
+      try { current = new URL(res.location, current).toString(); } catch { break; }
+      continue;
+    }
+    return { finalUrl: current, chain, reachable: true };
+  }
+  return { finalUrl: current, chain, reachable: true, truncated: true };
+}
+
 export async function preflight(candidateUrl, timeoutMs) {
   const u = new URL(candidateUrl);
   const host = u.hostname;
@@ -87,6 +148,24 @@ export async function preflight(candidateUrl, timeoutMs) {
     followRedirects(httpsUrl, timeoutMs),
   ]);
   const httpLandsOnHttps = http.ok && /^https:/i.test(http.finalUrl);
+
+  // A bad certificate hides the question that actually matters to the business: where does a
+  // browser that insists on HTTPS end up? Observed, never browsed (see httpsLandingAfterCertError).
+  if (https.error === 'cert_error') {
+    const landing = await httpsLandingAfterCertError(httpsUrl, timeoutMs);
+    if (landing) {
+      let landedHost = null;
+      try { landedHost = new URL(landing.finalUrl).hostname; } catch { /* leave null */ }
+      https.insecureLanding = {
+        finalUrl: landing.finalUrl,
+        finalHost: landedHost,
+        hops: landing.chain.length,
+        offDomain: !!landedHost && registrableDomain(landedHost) !== registrableDomain(host),
+        chain: landing.chain,
+      };
+    }
+  }
+
   let browseUrl = null;
   if (https.ok) browseUrl = https.finalUrl;
   else if (http.ok) browseUrl = http.finalUrl;
