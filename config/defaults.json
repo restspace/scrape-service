@@ -36,6 +36,7 @@
   },
 
   "crawl": {
+    "_depthComment": "Raised 3 -> 5 on 2026-08-25. Depth 3 reaches a blog post only if it is linked from the archive index page 1: home(0) -> /news(1) -> /news/page/2(2) -> post(3) is already at the limit, so everything past page 2 of any archive was unreachable by construction. Every crawl this project has ever run used the old default. maxPages still bounds the work; depth only decides what is ELIGIBLE.",
     "maxPages": 50,
     "respectRobotsTxt": true,
     "includeExternalAssets": false,
@@ -43,7 +44,7 @@
     "captureDesktop": true,
     "businessCategoryHint": null,
     "targetMarket": null,
-    "crawlDepth": 3,
+    "crawlDepth": 5,
     "allowedDomains": [],
     "excludedPathPatterns": [
       "/wp-admin",

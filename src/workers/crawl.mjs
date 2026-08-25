@@ -64,6 +64,20 @@ export function retryAfterMs(headers, fallbackMs, capMs = 60_000) {
   return Math.min(ms, capMs);
 }
 
+// Which tier the next page comes from. Exported for tests: this one decision is why a blog
+// archive is reachable or not. The tier furthest BELOW its quota share wins; a tier with
+// nothing queued is skipped entirely, so its share flows to the others rather than idling.
+export function chooseTier(has, taken, quotas) {
+  const total = taken.reduce((a, b) => a + b, 0);
+  let pick = -1, worst = Infinity;
+  for (let t = 0; t < quotas.length; t++) {
+    if (!has[t]) continue;
+    const deficit = taken[t] - quotas[t] * Math.max(1, total);
+    if (deficit < worst) { worst = deficit; pick = t; }
+  }
+  return pick === -1 ? 0 : pick;
+}
+
 export async function runCrawl(spec, ctx = {}) {
   const {
     outDir,
@@ -127,19 +141,66 @@ export async function runCrawl(spec, ctx = {}) {
   // seed queue — tiered so the site's own navigation is never starved by a large
   // sitemap backlog (tier 0: root + header/nav/footer links, tier 1: body links,
   // tier 2: sitemap). A queued URL is promoted if later discovered at a better tier.
+  // A site that answers on both schemes hands us every page twice: normalizeUrl keeps the
+  // scheme, so http://host/a and https://host/a are different frontier entries and both get
+  // captured. Measured on simoncooper.co.uk, 12 of 27 and 13 of 45 pages fetched in a job were
+  // http:// duplicates of pages already captured over https — a third to a half of the budget
+  // spent re-fetching what we already had, and 14 duplicate artefact directories to show for it.
+  // Canonicalise to the ROOT's scheme, and only for the root's own host, so a genuinely
+  // http-only third-party host is untouched. Done at the frontier, not in normalizeUrl: that
+  // function decides artefact directory names and is deliberately frozen.
+  const rootScheme = (() => { try { return new URL(cfg.rootUrl).protocol; } catch { return 'https:'; } })();
+  const rootHost = (() => { try { return new URL(cfg.rootUrl).hostname.toLowerCase(); } catch { return null; } })();
+  const canonicalScheme = (u) => {
+    if (!u || !rootHost) return u;
+    try {
+      const parsed = new URL(u);
+      if (parsed.protocol === rootScheme) return u;
+      if (parsed.hostname.toLowerCase() !== rootHost) return u;
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return u;
+      parsed.protocol = rootScheme;
+      return parsed.toString();
+    } catch { return u; }
+  };
+
   const start = normalizeUrl(cfg.rootUrl, rootOrigin);
   const queue = [{ url: start, depth: 0, tier: 0 }];
-  for (const u of sitemapUrls) if (hostAllowed(u, cfg.allowedDomains)) queue.push({ url: u, depth: 1, tier: 2 });
+  for (const raw of sitemapUrls) {
+    const u = canonicalScheme(raw);
+    if (hostAllowed(u, cfg.allowedDomains) && u !== start && !queue.some((q) => q.url === u)) {
+      queue.push({ url: u, depth: 1, tier: 2 });
+    }
+  }
 
   const queuedEntry = new Map(queue.map((q) => [q.url, q]));
   const queued = new Set(queue.map((q) => q.url));
+  // Tiers get a guaranteed SHARE of the budget, not strict priority. Strict priority was
+  // introduced so a big sitemap could not starve the site's own navigation, and it
+  // over-corrected: tier 0 is drained completely first, so on any site with a substantial
+  // header/footer the body links (tier 1) and the sitemap backlog (tier 2) are never reached
+  // at all. That is why every blog archive on this fleet was uncapturable — ha-accountants
+  // spent all 50 pages of a /news/-rooted crawl on nav pages and captured not one post, at
+  // depth 3 and again at depth 6 (2026-08-25). Raising maxPages, changing the root or
+  // excluding paths could not fix it, because none of them changes the ORDER.
+  //
+  // Quotas are floors, not caps: a tier that runs out of queued URLs hands its share to
+  // whoever is left, so a site with no sitemap still spends everything on nav and body.
+  const TIER_QUOTA = [0.5, 0.3, 0.2]; // tier 0 nav, tier 1 body, tier 2 sitemap
+  const tierTaken = [0, 0, 0];
   const dequeue = () => {
+    const has = [0, 1, 2].map((t) => queue.some((q) => q.tier === t));
+    const pick = chooseTier(has, tierTaken, TIER_QUOTA);
     let best = -1;
     for (let i = 0; i < queue.length; i++) {
-      if (best === -1 || queue[i].tier < queue[best].tier) best = i;
-      if (queue[best].tier === 0) break;
+      if (queue[i].tier !== pick) continue;
+      best = i;
+      break;
+    }
+    if (best === -1) {
+      for (let i = 0; i < queue.length; i++) if (best === -1 || queue[i].tier < queue[best].tier) best = i;
     }
     const entry = queue.splice(best, 1)[0];
+    if (entry && entry.tier >= 0 && entry.tier <= 2) tierTaken[entry.tier]++;
     queuedEntry.delete(entry.url);
     return entry;
   };
@@ -338,7 +399,7 @@ export async function runCrawl(spec, ctx = {}) {
         if (depth < cfg.crawlDepth) {
           for (const l of data.links) {
             if (l.type !== 'internal') continue;
-            const n = normalizeUrl(l.href, finalUrl);
+            const n = canonicalScheme(normalizeUrl(l.href, finalUrl));
             if (!n || crawled.has(n)) continue;
             if (!hostAllowed(n, cfg.allowedDomains)) continue;
             const tier = ['header', 'navigation', 'footer'].includes(l.appearsIn) ? 0 : 1;
