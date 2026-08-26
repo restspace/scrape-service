@@ -44,6 +44,37 @@ export function pathExcluded(urlStr, patterns) {
   }
 }
 
+/**
+ * The host+path of a URL that carries a query string, or null when it carries none. Used to
+ * cap how many query-string VARIANTS of one path a crawl will fetch: a parameterised URL is
+ * usually the same page (or a redirect to the same page) under a different key, and each
+ * variant costs a fetch against maxPages. Not applied inside normalizeUrl on purpose — that
+ * function names artefact directories and is frozen.
+ */
+export function queryVariantKey(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (!u.search || u.search === '?') return null;
+    return `${u.hostname.toLowerCase()}${u.pathname.toLowerCase()}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether fetching `urlStr` would exceed `max` query-string variants of its path. `counts`
+ * is the crawl's Map(key -> fetched so far); a URL without a query never counts. When the
+ * answer is "fetch it", the count is incremented here so the caller has one decision point.
+ */
+export function variantCapExceeded(counts, urlStr, max) {
+  const key = queryVariantKey(urlStr);
+  if (!key || !Number.isFinite(max) || max <= 0) return false;
+  const n = counts.get(key) ?? 0;
+  if (n >= max) return true;
+  counts.set(key, n + 1);
+  return false;
+}
+
 export function slugForUrl(urlStr, used) {
   const u = new URL(urlStr);
   let base = u.pathname.replace(/^\/|\/$/g, '');

@@ -23,7 +23,7 @@ export class ValidationError extends Error {
 const CRAWL_FIELDS = new Set([
   'rootUrl', 'maxPages', 'crawlDepth', 'respectRobotsTxt', 'captureDesktop', 'captureMobile',
   'excludedPathPatterns', 'timeoutMs', 'navWaitUntil', 'businessCategoryHint', 'targetMarket',
-  'allowedDomains',
+  'allowedDomains', 'maxQueryVariantsPerPath',
 ]);
 
 const NAV_WAIT = new Set(['load', 'domcontentloaded', 'networkidle', 'commit']);
@@ -97,6 +97,12 @@ export function validateCrawlRequest(body, limits) {
 
   const crawlDepth = optionalInt(body, 'crawlDepth', { min: 0, max: 6 });
   if (crawlDepth !== undefined) spec.crawlDepth = crawlDepth;
+
+  // How many query-string variants of one path a crawl may fetch (0 = unlimited). Raise it
+  // for a site whose real pages live behind ?p= / ?id= keys; the default protects the budget
+  // from parameterised redirect farms.
+  const maxQueryVariantsPerPath = optionalInt(body, 'maxQueryVariantsPerPath', { min: 0, max: 500 });
+  if (maxQueryVariantsPerPath !== undefined) spec.maxQueryVariantsPerPath = maxQueryVariantsPerPath;
 
   const timeoutMs = optionalInt(body, 'timeoutMs', { min: 1000, max: 120_000 });
   if (timeoutMs !== undefined) spec.timeoutMs = timeoutMs;

@@ -45,6 +45,8 @@
     "businessCategoryHint": null,
     "targetMarket": null,
     "crawlDepth": 5,
+    "_variantComment": "Added 2026-08-26. Most fetches of one path's query-string variants a crawl will make; 0 = unlimited. landerstheaccountants.com spent 34 of 120 pages on special_reports_downloads.php?which=<key>, each redirecting to the same excluded login page. Raise per job for sites whose real pages live behind ?p=/?id= keys.",
+    "maxQueryVariantsPerPath": 3,
     "allowedDomains": [],
     "excludedPathPatterns": [
       "/wp-admin",

@@ -21,7 +21,7 @@ import { launchBrowser, makeDesktopContext, makeMobileContext } from '../capture
 import { extractInPage, collectMetadataImages, FULL_CAPABILITIES } from '../capture/extract.mjs';
 import { settlePage } from '../capture/settle.mjs';
 import { loadRobots, discoverSitemapUrls, makeRobotsBlocker } from '../capture/robots.mjs';
-import { normalizeUrl, hostAllowed, pathExcluded, slugForUrl, sha256 } from '../capture/urls.mjs';
+import { normalizeUrl, hostAllowed, pathExcluded, slugForUrl, sha256, variantCapExceeded } from '../capture/urls.mjs';
 import { assertNavigable, checkFrontierUrl, BlockedUrlError } from '../net/guard.mjs';
 
 export class CrawlAbortedError extends Error {
@@ -221,6 +221,20 @@ export async function runCrawl(spec, ctx = {}) {
     }
   });
 
+  // Budget protection against parameterised URLs (2026-08-26, landerstheaccountants.com):
+  // one gap crawl spent 34 of 120 pages fetching special_reports_downloads.php?which=<key>
+  // — every one a distinct frontier entry, every one redirecting to the same excluded
+  // /login/why_register.php, which was then captured 34 times because exclusions were only
+  // ever applied to the URL asked for. Three guards, all recorded in `skipped` with a reason:
+  //   variantFetches   — at most cfg.maxQueryVariantsPerPath fetches of one path's query
+  //                      variants (query_variant_cap);
+  //   landed-URL checks — path exclusions re-applied to where the browser LANDED, after the
+  //                      HTTP redirect and again after settle (excluded_path_redirect);
+  //   capturedFinal    — a redirect that lands on a page already captured is not captured
+  //                      again (redirect_target_duplicate).
+  const variantFetches = new Map(); // host+path -> query variants fetched
+  const capturedFinal = new Set(); // every finalUrl captured so far
+
   const browser = await launchBrowser();
   const desktop = await makeDesktopContext(browser, { userAgent });
   const mobile = cfg.captureMobile ? await makeMobileContext(browser) : null;
@@ -235,6 +249,7 @@ export async function runCrawl(spec, ctx = {}) {
       if (pathExcluded(url, cfg.excludedPathPatterns)) { skipped.push({ url, reason: 'excluded_path' }); continue; }
       if (robotsBlocks(url)) { skipped.push({ url, reason: 'robots_disallow' }); continue; }
       if (depth > cfg.crawlDepth) { skipped.push({ url, reason: 'depth_exceeded' }); continue; }
+      if (variantCapExceeded(variantFetches, url, cfg.maxQueryVariantsPerPath)) { skipped.push({ url, reason: 'query_variant_cap', max: cfg.maxQueryVariantsPerPath }); continue; }
 
       // Re-check at navigation time, not just at discovery: this is the DNS
       // rebinding window, and a same-host redirect could land anywhere.
@@ -261,6 +276,12 @@ export async function runCrawl(spec, ctx = {}) {
         // browser landed on — an HTTP redirect can hop to any host.
         if (!hostAllowed(finalUrl, cfg.allowedDomains)) {
           skipped.push({ url, reason: 'offsite_redirect', finalUrl });
+          await page.close();
+          continue;
+        }
+        // Same for path exclusions: a redirect into an excluded subtree is still excluded.
+        if (finalUrl !== url && pathExcluded(finalUrl, cfg.excludedPathPatterns)) {
+          skipped.push({ url, reason: 'excluded_path_redirect', finalUrl });
           await page.close();
           continue;
         }
@@ -300,6 +321,18 @@ export async function runCrawl(spec, ctx = {}) {
         const settledUrl = normalizeUrl(page.url(), rootOrigin);
         if (!hostAllowed(settledUrl, cfg.allowedDomains)) {
           skipped.push({ url, reason: 'offsite_redirect', finalUrl: settledUrl });
+          await page.close();
+          continue;
+        }
+        if (settledUrl !== url && pathExcluded(settledUrl, cfg.excludedPathPatterns)) {
+          skipped.push({ url, reason: 'excluded_path_redirect', finalUrl: settledUrl });
+          await page.close();
+          continue;
+        }
+        // A redirect onto a page already captured (under its own URL or via another
+        // redirect) adds nothing but a duplicate artefact directory.
+        if (settledUrl !== url && (capturedFinal.has(settledUrl) || crawled.has(settledUrl))) {
+          skipped.push({ url, reason: 'redirect_target_duplicate', finalUrl: settledUrl });
           await page.close();
           continue;
         }
@@ -372,6 +405,8 @@ export async function runCrawl(spec, ctx = {}) {
           writeFile(path.join(dir, 'content.html'), data.contentHtml || ''),
         ]);
 
+        capturedFinal.add(finalUrl);
+        capturedFinal.add(settledUrl);
         crawled.set(url, {
           slug,
           sourceUrl: url,
