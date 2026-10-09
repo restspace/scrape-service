@@ -30,7 +30,9 @@ as `null` on purpose, for that later stage to fill in.
 src/
   server.mjs            HTTP API, binds 127.0.0.1 only
   jobs/store.mjs        durable job records (atomic write+rename)
-  jobs/queue.mjs        worker pool, per-domain token bucket, timeouts
+  config.mjs            defaults.json + environment overrides; the crawler's identity
+  jobs/queue.mjs        worker pool: job slots, one job per domain at a time, timeouts
+  jobs/politeness.mjs   per-domain request rate inside one job
   jobs/gc.mjs           TTL sweep + disk high-water mark
   capture/browser.mjs   chromium launch, desktop + mobile contexts
   capture/extract.mjs   the single in-page extractor
@@ -119,6 +121,60 @@ sitemap.
   ignored robots entirely; that was defensible for a hand-picked local batch and
   is not defensible for a shared server.
 
+## Who the crawler says it is
+
+Every desktop page request the crawl worker makes, and every `robots.txt` and
+sitemap fetch by either worker, carries:
+
+```
+RapiderITBot/1.0 (+https://rapiderit.com/bot/)
+```
+
+and `robots.txt` is read as the crawler `RapiderITBot`. A group addressed to
+that name (any case, with or without a version) is obeyed and replaces the
+`User-agent: *` group, as RFC 9309 specifies; with no such group the `*` rules
+apply. Inside the chosen group only `Disallow` is interpreted, as a path prefix:
+`Allow`, wildcards and `Crawl-delay` are not, so the crawler can only stay away
+from more than it was asked to. The request rate is the fixed per-domain
+interval in `config/defaults.json` (`politeness`).
+
+The scan worker differs in one respect, and has since it was ported: it checks
+`robots.txt` under the identity above, but it loads pages with a desktop Chrome
+and an iPhone Safari user agent, because it records how a site presents itself
+to an ordinary visitor on each. Its plain-HTTP reachability and link probes say
+`ProspectScanBot/1.0`. Only the crawl worker presents the identity on page
+requests, and only on its desktop pass: when `captureMobile` is on, the mobile
+pass re-visits the same pages under Playwright's iPhone 13 emulation, whose
+user agent is mobile Safari's.
+
+The identity is configuration, because other products run this service under
+their own name: `server.userAgent` and `server.robotsToken` in
+`config/defaults.json`, overridden by `CRAWLER_USER_AGENT` and
+`CRAWLER_ROBOTS_TOKEN`. Set both together; the service refuses to start if the
+token does not appear in the user agent, since a site could then not address the
+crawler it sees in its logs. `GET /health` reports the identity in use.
+
+## Concurrency
+
+`CONCURRENT_JOBS` (`server.concurrentJobs`) is the number of jobs run at once,
+each in its own child process with its own Chromium. Jobs beyond that wait in
+submission order. What holds with more than one slot:
+
+- **One job per domain.** A job is held back while another job is running
+  against any of its domains (a crawl's root and `allowedDomains`, every
+  candidate of a scan), and later jobs for other domains go ahead of it. The
+  per-domain rate limit lives inside each job's process, so this is what keeps a
+  site from being crawled at double the rate. It works from the job spec: a root
+  URL that redirects to a domain another job is crawling is not detected.
+- **Dedupe is atomic.** Identical requests arriving together create one job.
+- **Disk.** Each running job may hold up to `ARTEFACT_BYTES_PER_JOB` on local
+  disk, so allow `CONCURRENT_JOBS` times that, plus anything not yet evicted.
+- **Memory.** One crawl was measured peaking at 887 MiB.
+- **Recovery.** Jobs that were running when the process died are all requeued
+  on the next boot and run together again, up to two attempts each.
+- **One process.** All of the above is in-process state. Running two instances
+  of the service against the same store is not supported.
+
 ## Cloudflare deployment
 
 Production runs as a [Cloudflare Container](https://developers.cloudflare.com/containers/)
@@ -147,6 +203,11 @@ What changes when the `R2_*` variables are set (`src/jobs/remote.mjs`):
   lifecycle rules (seven days on each prefix above).
 
 With no `R2_*` variables the service is disk-only, exactly as before.
+
+The container is a `standard-2` instance (1 vCPU, 6 GiB memory, 12 GB disk) and
+runs two jobs at once; `CONCURRENT_JOBS` on the Worker overrides the number.
+The two settings are sized together: see the comments in
+`deploy/cloudflare/wrangler.jsonc` and `deploy/cloudflare/src/index.js`.
 
 The Worker vetoes sleep while the service reports active or queued jobs
 (`onActivityExpired` probes `/health`), so a long crawl with nobody polling is

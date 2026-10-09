@@ -6,6 +6,13 @@
 // the RS2 node that serves client sites, and each chromium context costs
 // 150-300 MB — "how many can we run" is the wrong question, "what can the box
 // spare without degrading the sites people are paying for" is the right one.
+//
+// Two jobs never work the same domain at once. Each job's politeness gate lives
+// in its own child process, so two jobs on one site would each apply the
+// per-domain limit separately and the site would see double the request rate.
+// The queue is the only place that can see every job, so it holds a job back
+// while another one is running against any of its domains, and lets later jobs
+// for other domains go ahead of it.
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -14,17 +21,43 @@ import readline from 'node:readline';
 
 import { STATUS } from './store.mjs';
 import { dirSize } from './gc.mjs';
+import { politenessKey } from '../capture/urls.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RUN_JOB = path.join(here, '..', 'workers', 'run-job.mjs');
 
+/**
+ * The politeness domains a job will send requests to, as far as its spec says:
+ * a crawl's root (and any extra allowed domains), every candidate of a scan.
+ * A site that redirects to a different domain is not known until the job runs.
+ */
+export function jobDomains(job) {
+  const spec = job?.spec ?? {};
+  const urls = [];
+  if (typeof spec.rootUrl === 'string') urls.push(spec.rootUrl);
+  for (const c of Array.isArray(spec.candidates) ? spec.candidates : []) {
+    const url = typeof c === 'string' ? c : c?.url;
+    if (typeof url === 'string') urls.push(url);
+  }
+  const keys = new Set(urls.map(politenessKey));
+  for (const d of Array.isArray(spec.allowedDomains) ? spec.allowedDomains : []) {
+    if (typeof d === 'string' && d) keys.add(politenessKey(`http://${d}/`));
+  }
+  return keys;
+}
+
 export class JobQueue {
-  constructor({ store, limits, concurrency = 2, logger = console }) {
+  /**
+   * @param {object} opts
+   * @param {string} [opts.workerScript] the child entry point; tests substitute a stand-in that launches no browser
+   */
+  constructor({ store, limits, concurrency = 2, logger = console, workerScript = RUN_JOB }) {
     this.store = store;
     this.limits = limits;
     this.concurrency = concurrency;
     this.logger = logger;
-    /** @type {Map<string, {child: import('node:child_process').ChildProcess, timer: NodeJS.Timeout}>} */
+    this.workerScript = workerScript;
+    /** @type {Map<string, {child: import('node:child_process').ChildProcess, timer: NodeJS.Timeout, sizeTimer: NodeJS.Timeout|null, domains: Set<string>}>} */
     this.running = new Map();
     this.stopped = false;
     this.wakeup = null;
@@ -71,11 +104,21 @@ export class JobQueue {
     // Every queued job of this boot is on local disk (created here, or requeued
     // here by recovery), so the poll never needs a remote listing.
     const { jobs } = await this.store.list({ status: STATUS.QUEUED, limit: 50, localOnly: true });
-    // list() is newest-first; take the oldest queued job so the queue is FIFO.
-    const job = jobs[jobs.length - 1];
-    if (!job) return null;
-    if (this.running.has(job.jobId)) return null;
-    return job;
+    const busy = new Set();
+    for (const entry of this.running.values()) for (const d of entry.domains) busy.add(d);
+    // list() is newest-first; walk from the oldest so the queue is FIFO.
+    for (let i = jobs.length - 1; i >= 0; i--) {
+      const job = jobs[i];
+      // A job launched a moment ago still reads `queued` until its record is
+      // rewritten. It must be passed over, not treated as the end of the
+      // queue, or a second free slot would sit idle behind it.
+      if (this.running.has(job.jobId)) continue;
+      // Held back while another job is working one of its domains; it becomes
+      // eligible when that job finishes (which pokes this loop).
+      if ([...jobDomains(job)].some((d) => busy.has(d))) continue;
+      return job;
+    }
+    return null;
   }
 
   #wallClockFor(kind) {
@@ -87,7 +130,7 @@ export class JobQueue {
   #launch(job) {
     const child = spawn(
       process.execPath,
-      [RUN_JOB, '--job', job.jobId, '--job-root', this.store.jobRoot, '--artefact-root', this.store.artefactRoot],
+      [this.workerScript, '--job', job.jobId, '--job-root', this.store.jobRoot, '--artefact-root', this.store.artefactRoot],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
 
@@ -126,7 +169,7 @@ export class JobQueue {
       : null;
     sizeTimer?.unref?.();
 
-    this.running.set(job.jobId, { child, timer, sizeTimer });
+    this.running.set(job.jobId, { child, timer, sizeTimer, domains: jobDomains(job) });
 
     this.store.update(job.jobId, {
       status: STATUS.RUNNING,

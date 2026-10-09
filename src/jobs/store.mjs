@@ -74,6 +74,29 @@ export class JobStore {
     this.remoteCache = new Map();
     /** Per-job promise chain, so mirrored writes land in the order they were made. */
     this.mirrorChains = new Map();
+    /** Per-job promise chain, so read-modify-write updates of one record never interleave. */
+    this.recordChains = new Map();
+    this.tmpSeq = 0;
+  }
+
+  /**
+   * Run `fn` once every earlier change to this job's record has finished.
+   *
+   * A running job's record is changed from several places at once: the queue
+   * marking it running, progress flushes, the exit handler, a DELETE. Each is
+   * read-modify-write, so two that overlap lose one of the changes: a progress
+   * flush that read the record before it was marked running would write
+   * `queued` back over `running`.
+   */
+  #exclusive(jobId, fn) {
+    const prev = this.recordChains.get(jobId) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    const tail = next.catch(() => {});
+    this.recordChains.set(jobId, tail);
+    tail.then(() => {
+      if (this.recordChains.get(jobId) === tail) this.recordChains.delete(jobId);
+    });
+    return next;
   }
 
   async init() {
@@ -110,10 +133,12 @@ export class JobStore {
     const dir = this.dir(job.jobId);
     await mkdir(dir, { recursive: true });
     const target = path.join(dir, 'job.json');
-    const tmp = path.join(dir, `.job.json.${process.pid}.tmp`);
+    // Unique per write, not just per process: two writes of one record must
+    // never share a temporary file.
+    const tmp = path.join(dir, `.job.json.${process.pid}.${++this.tmpSeq}.tmp`);
     const json = JSON.stringify(job, null, 2);
     await writeFile(tmp, json);
-    await rename(tmp, target);
+    await renameOver(tmp, target);
 
     if (this.remote) {
       const mirrored = this.#mirror(job.jobId, json);
@@ -190,17 +215,21 @@ export class JobStore {
   }
 
   async update(jobId, patch) {
-    const job = await this.get(jobId);
-    if (!job) return null;
-    this.remoteCache.delete(jobId);
-    return this.#write({ ...job, ...patch });
+    return this.#exclusive(jobId, async () => {
+      const job = await this.get(jobId);
+      if (!job) return null;
+      this.remoteCache.delete(jobId);
+      return this.#write({ ...job, ...patch });
+    });
   }
 
   /** Merge into progress without clobbering sibling keys. */
   async mergeProgress(jobId, progress) {
-    const job = await this.get(jobId);
-    if (!job) return null;
-    return this.#write({ ...job, progress: { ...job.progress, ...progress } });
+    return this.#exclusive(jobId, async () => {
+      const job = await this.get(jobId);
+      if (!job) return null;
+      return this.#write({ ...job, progress: { ...job.progress, ...progress } });
+    });
   }
 
   async #localIds() {
@@ -270,8 +299,11 @@ export class JobStore {
 
   async remove(jobId) {
     if (!JOB_ID.test(jobId)) return false;
-    await rm(this.dir(jobId), { recursive: true, force: true });
-    await rm(this.artefactDir(jobId), { recursive: true, force: true });
+    // In turn with record updates, so one in flight cannot recreate the directory.
+    await this.#exclusive(jobId, async () => {
+      await rm(this.dir(jobId), { recursive: true, force: true });
+      await rm(this.artefactDir(jobId), { recursive: true, force: true });
+    });
     this.remoteCache.delete(jobId);
     if (this.remote) {
       // Let any in-flight mirror land first, or it would resurrect the record.
@@ -397,6 +429,22 @@ async function walk(root) {
   };
   await visit(root, '');
   return files;
+}
+
+/**
+ * rename() that tolerates a reader. On Windows, replacing a file that another
+ * handle has open (a poll reading job.json at that instant) fails with EPERM,
+ * EACCES or EBUSY; the handle is gone a moment later. POSIX never takes this path.
+ */
+async function renameOver(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await rename(from, to);
+    } catch (e) {
+      if (attempt >= 20 || !['EPERM', 'EACCES', 'EBUSY'].includes(e.code)) throw e;
+      await new Promise((r) => setTimeout(r, 10 + attempt * 5));
+    }
+  }
 }
 
 function defaultIsAlive(pid) {

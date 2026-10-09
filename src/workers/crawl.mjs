@@ -21,6 +21,7 @@ import { launchBrowser, makeDesktopContext, makeMobileContext } from '../capture
 import { extractInPage, collectMetadataImages, FULL_CAPABILITIES } from '../capture/extract.mjs';
 import { settlePage } from '../capture/settle.mjs';
 import { loadRobots, discoverSitemapUrls, makeRobotsBlocker } from '../capture/robots.mjs';
+import { DEFAULT_USER_AGENT, DEFAULT_ROBOTS_TOKEN } from '../config.mjs';
 import { normalizeUrl, hostAllowed, pathExcluded, slugForUrl, sha256, variantCapExceeded } from '../capture/urls.mjs';
 import { assertNavigable, checkFrontierUrl, BlockedUrlError } from '../net/guard.mjs';
 
@@ -82,7 +83,8 @@ export async function runCrawl(spec, ctx = {}) {
   const {
     outDir,
     defaults = {},
-    userAgent = 'Mozilla/5.0 (compatible; AtelyrCaptureBot/1.0; +https://atelyr.com/bot)',
+    userAgent = DEFAULT_USER_AGENT,
+    robotsToken = DEFAULT_ROBOTS_TOKEN,
     signal,
     onProgress = () => {},
     politeness = null,
@@ -122,9 +124,12 @@ export async function runCrawl(spec, ctx = {}) {
     respect: cfg.respectRobotsTxt,
     timeoutMs: cfg.timeoutMs,
     userAgent,
+    robotsToken,
   });
   if (robotsTxtFound) {
     log(`robots.txt found (${robots.disallow.length} disallow rules, ${robots.sitemaps.length} sitemaps)`);
+    // A separate line: the one above keeps the wording the original CLI used.
+    if (robots.group === 'token') log(`robots.txt has rules addressed to ${robotsToken}; following those`);
   }
 
   const sitemapCandidates = robots.sitemaps.length ? robots.sitemaps : [rootOrigin + '/sitemap.xml'];

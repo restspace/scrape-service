@@ -11,8 +11,9 @@
 //   * robots.txt is now honoured. The original ignored it entirely, which was
 //     defensible for a hand-picked local batch and is not defensible for a
 //     server that scans hundreds of third-party sites unattended.
-//   * every candidate URL passes the SSRF guard, and per-domain politeness is
-//     shared with any concurrent crawl job.
+//   * every candidate URL passes the SSRF guard, and the per-domain politeness
+//     limits apply. The queue does not run this job alongside another job that
+//     targets one of the same domains.
 //
 // The batch.json resume model is kept as-is: it was already the better of the
 // two workers in this respect, and the job engine relies on it to make a
@@ -26,6 +27,7 @@ import path from 'node:path';
 import { launchBrowser } from '../capture/browser.mjs';
 import { extractInPage, SCAN_CAPABILITIES } from '../capture/extract.mjs';
 import { loadRobots, makeRobotsBlocker } from '../capture/robots.mjs';
+import { DEFAULT_USER_AGENT, DEFAULT_ROBOTS_TOKEN } from '../config.mjs';
 import { checkFrontierUrl } from '../net/guard.mjs';
 
 export class ScanAbortedError extends Error {
@@ -514,7 +516,8 @@ export async function runScan(spec, ctx = {}) {
   const {
     outDir,
     defaults = {},
-    userAgent = 'Mozilla/5.0 (compatible; AtelyrCaptureBot/1.0; +https://atelyr.com/bot)',
+    userAgent = DEFAULT_USER_AGENT,
+    robotsToken = DEFAULT_ROBOTS_TOKEN,
     signal,
     onProgress = () => {},
     politeness = null,
@@ -599,7 +602,7 @@ export async function runScan(spec, ctx = {}) {
           continue;
         }
 
-        if (cfg.respectRobotsTxt && await robotsForbids(cand.url, cfg, userAgent)) {
+        if (cfg.respectRobotsTxt && await robotsForbids(cand.url, cfg, userAgent, robotsToken)) {
           log(`${cand.id}: SKIPPED (robots.txt disallows)`);
           batch.sites[cand.id] = {
             name: cand.name, url: cand.url, status: 'done', outcome: 'robots_disallow',
@@ -675,13 +678,14 @@ function slugFromUrl(url) {
  * batch spans many hosts; a fetch failure is treated as "not disallowed",
  * matching how the crawl path treats a missing robots.txt.
  */
-async function robotsForbids(url, cfg, userAgent) {
+async function robotsForbids(url, cfg, userAgent, robotsToken) {
   try {
     const origin = new URL(url).origin;
     const { robots } = await loadRobots(origin, {
       respect: true,
       timeoutMs: cfg.probeTimeoutMs ?? 15000,
       userAgent,
+      robotsToken,
     });
     return makeRobotsBlocker(robots, true)(url);
   } catch {

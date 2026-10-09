@@ -13,14 +13,12 @@
 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { runCrawl, CrawlAbortedError } from './crawl.mjs';
 import { runScan, ScanAbortedError } from './scan.mjs';
 import { PolitenessGate } from '../jobs/politeness.mjs';
 import { BlockedUrlError } from '../net/guard.mjs';
-
-const here = path.dirname(fileURLToPath(import.meta.url));
+import { loadConfig } from '../config.mjs';
 
 const args = process.argv.slice(2);
 const opt = {};
@@ -51,14 +49,23 @@ process.on('SIGINT', () => controller.abort('cancelled'));
 async function main() {
   const jobPath = path.join(opt['job-root'], opt.job, 'job.json');
   const job = JSON.parse(await readFile(jobPath, 'utf8'));
-  const defaults = JSON.parse(await readFile(path.join(here, '..', '..', 'config', 'defaults.json'), 'utf8'));
+  // The same loader as the API process, so environment overrides (the crawler's
+  // identity) apply to the process that makes the requests.
+  const defaults = await loadConfig();
 
   const outDir = path.join(opt['artefact-root'], job.jobId);
-  const politeness = new PolitenessGate(defaults.politeness);
+  // This gate is private to the job. Jobs never share a domain while they run
+  // (the queue holds back a job whose domain is already being worked), so one
+  // gate per job is enough to keep a site's request rate within the limit.
+  const politeness = new PolitenessGate({
+    minIntervalMs: defaults.politeness.minIntervalMsPerDomain,
+    maxConcurrentPerDomain: defaults.politeness.maxConcurrentPerDomain,
+  });
 
   const ctx = {
     outDir,
     userAgent: defaults.server.userAgent,
+    robotsToken: defaults.server.robotsToken,
     signal: controller.signal,
     politeness,
     onProgress: (e) => emit(e),

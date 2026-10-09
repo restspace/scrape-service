@@ -2,7 +2,8 @@
 //
 // The desktop User-Agent changes from the original 'WebsiteReconstructionBot/1.0'
 // to a UA carrying a contact URL. Same intent — identify honestly — but a server
-// crawling third-party sites should say who to complain to.
+// crawling third-party sites should say who to complain to. The UA itself is
+// configuration (`server.userAgent`, see src/config.mjs), not a constant here.
 
 import { chromium, devices } from 'playwright';
 

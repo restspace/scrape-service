@@ -85,6 +85,23 @@ test('deduplicates an identical in-flight request', async () => {
   assert.equal(second.deduplicated, true);
 });
 
+test('identical requests arriving together create one job, not several', async () => {
+  // With more than one job slot, duplicates created by this race would crawl
+  // the same site at the same time.
+  const spec = { rootUrl: 'https://example.com/dedupe-race', maxPages: 5 };
+  const responses = await Promise.all(Array.from({ length: 8 }, () => post('/crawls', spec)));
+  const bodies = await Promise.all(responses.map((r) => r.json()));
+  assert.equal(responses.filter((r) => r.status === 202).length, 1, 'exactly one request creates the job');
+  assert.equal(responses.filter((r) => r.status === 200).length, 7, 'the rest are told it already exists');
+  assert.equal(new Set(bodies.map((b) => b.jobId)).size, 1);
+});
+
+test('health reports who the crawler says it is', async () => {
+  const body = await (await fetch(`${base}/health`)).json();
+  assert.equal(body.userAgent, 'RapiderITBot/1.0 (+https://rapiderit.com/bot/)');
+  assert.equal(body.robotsToken, 'RapiderITBot');
+});
+
 test('dedup ignores property order', async () => {
   const a = await (await post('/crawls', { rootUrl: 'https://example.com/order', maxPages: 4 })).json();
   const b = await (await post('/crawls', { maxPages: 4, rootUrl: 'https://example.com/order' })).json();

@@ -6,7 +6,9 @@
     "port": 8081,
     "artefactRoot": "./var/artefacts",
     "jobRoot": "./var/jobs",
-    "userAgent": "Mozilla/5.0 (compatible; AtelyrCaptureBot/1.0; +https://atelyr.com/bot)",
+    "_identityComment": "Who the crawler says it is. userAgent is sent with every crawl request and every robots.txt/sitemap fetch; robotsToken is the name robots.txt rules are matched against and must appear in userAgent. Override per deployment with CRAWLER_USER_AGENT and CRAWLER_ROBOTS_TOKEN (set both). src/config.mjs holds the same two values as code fallbacks.",
+    "userAgent": "RapiderITBot/1.0 (+https://rapiderit.com/bot/)",
+    "robotsToken": "RapiderITBot",
     "concurrentJobs": 2,
     "dedupeWindowMs": 900000
   },
@@ -24,7 +26,7 @@
   },
 
   "politeness": {
-    "_comment": "Per-registrable-domain token bucket shared across all jobs, so two concurrent jobs can never hammer one host. Did not exist locally, where crawls were sequential and hand-picked.",
+    "_comment": "Per-registrable-domain limit on request rate and simultaneous requests. Each job runs in its own process and applies these to itself; the queue (src/jobs/queue.mjs) never runs two jobs that target the same domain at once, which is what stops two concurrent jobs hammering one host. Did not exist locally, where crawls were sequential and hand-picked.",
     "minIntervalMsPerDomain": 800,
     "maxConcurrentPerDomain": 1
   },

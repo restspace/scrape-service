@@ -7,8 +7,10 @@
 // access roles. So the chain is unchanged: RS2 authz, then a secret only RS2
 // holds, then the service.
 //
-// One named instance ("main"): the service owns a job queue and per-domain
-// politeness, both of which assume a single process.
+// One named instance ("main"): the service owns a job queue, and that queue is
+// what keeps two jobs off the same domain, so it assumes a single process.
+// More capacity means more job slots in this instance (CONCURRENT_JOBS below),
+// not more instances.
 
 import { Container, getContainer } from '@cloudflare/containers';
 
@@ -35,18 +37,34 @@ export class ScrapeContainer extends Container {
       R2_BUCKET: env.R2_BUCKET,
       R2_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID,
       R2_SECRET_ACCESS_KEY: env.R2_SECRET_ACCESS_KEY,
-      // Sizing for a standard-1 instance (4 GiB memory, 8 GB scratch disk).
-      CONCURRENT_JOBS: env.CONCURRENT_JOBS ?? '1',
+      // Sizing for a standard-2 instance (1 vCPU, 6 GiB memory, 12 GB disk);
+      // keep in step with instance_type in wrangler.jsonc.
+      //
+      // Two jobs at once, each its own Chromium: 2 x 887 MiB measured peak is
+      // about 1.8 GiB of the 6 GiB, and the two share one vCPU, so each gets
+      // the half vCPU a lone job had on standard-1. Disk: each running job may
+      // hold up to ARTEFACT_BYTES_PER_JOB locally until it is published to R2
+      // and evicted, so the worst case is CONCURRENT_JOBS x that (2 GiB here)
+      // of the 12 GB. Raising CONCURRENT_JOBS means re-doing this sum, and
+      // moving up an instance size before the vCPU share per job drops.
+      CONCURRENT_JOBS: env.CONCURRENT_JOBS ?? '2',
       MAX_PAGES_CEILING: env.MAX_PAGES_CEILING ?? '120',
       ARTEFACT_BYTES_PER_JOB: env.ARTEFACT_BYTES_PER_JOB ?? String(1024 ** 3),
       ARTEFACT_TTL_DAYS: env.ARTEFACT_TTL_DAYS ?? '7',
     };
+    // Who the crawler says it is. Unset, the service uses the identity in its
+    // config/defaults.json (RapiderITBot). Set both or neither: the service
+    // refuses to start if the robots token is not part of the user agent.
+    if (env.CRAWLER_USER_AGENT) this.envVars.CRAWLER_USER_AGENT = env.CRAWLER_USER_AGENT;
+    if (env.CRAWLER_ROBOTS_TOKEN) this.envVars.CRAWLER_ROBOTS_TOKEN = env.CRAWLER_ROBOTS_TOKEN;
   }
 
   /**
    * Called when `sleepAfter` elapses with no inbound requests. A crawl can run
    * for fifteen minutes with nobody polling, and sleeping would kill it — so
-   * ask the service whether it has work before stopping.
+   * ask the service whether it has work before stopping. `activeJobs` counts
+   * every running job and `queueDepth` every waiting one, so this holds for
+   * any CONCURRENT_JOBS.
    */
   async onActivityExpired() {
     try {

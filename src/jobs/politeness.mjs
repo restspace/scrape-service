@@ -1,10 +1,15 @@
-// Per-domain politeness, shared across every job on the box.
+// Per-domain politeness within one job.
 //
 // Locally this did not exist and did not need to: crawl.mjs was sequential and
 // scan.mjs ran a handful of hand-picked sites. On a server, two jobs can target
 // the same host at once, and "concurrency 2" quietly becomes "two simultaneous
-// crawlers hammering one small business's shared hosting". This makes that
-// impossible regardless of how many jobs are in flight.
+// crawlers hammering one small business's shared hosting".
+//
+// A gate only sees the requests of the process it lives in, and every job runs
+// in its own child process (workers/run-job.mjs), so this alone does not stop
+// that. The other half is in jobs/queue.mjs: it never runs two jobs against the
+// same domain at the same time. Together they hold a domain to one job, and
+// that job to the limits below.
 //
 // Two constraints per domain: a minimum interval between requests, and a cap on
 // simultaneous requests. Both are enforced by the same gate.

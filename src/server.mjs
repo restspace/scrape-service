@@ -10,7 +10,6 @@
 // also accepted so that a direct curl can use the same path as the public URL.
 
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,6 +20,9 @@ import { validateCrawlRequest, validateScanRequest, ValidationError } from './va
 import { assertNavigable, BlockedUrlError } from './net/guard.mjs';
 import { chromiumVersion } from './capture/browser.mjs';
 import { remoteFromEnv } from './jobs/remote.mjs';
+import { loadConfig } from './config.mjs';
+
+export { loadConfig };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const MAX_BODY_BYTES = 1_000_000;
@@ -52,6 +54,14 @@ export async function createServer({ config, logger = console, remote = remoteFr
   const gc = new ArtefactGC({ store, ...config.gc, logger });
 
   let cachedChromium = null;
+
+  let createChain = Promise.resolve();
+  /** Run `fn` after every earlier call has settled, whatever their outcome. */
+  function serialiseCreate(fn) {
+    const run = createChain.then(fn, fn);
+    createChain = run.catch(() => {});
+    return run;
+  }
 
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
@@ -117,6 +127,8 @@ export async function createServer({ config, logger = console, remote = remoteFr
       ok: typeof cachedChromium === 'string' && !cachedChromium.startsWith('unavailable'),
       chromiumVersion: cachedChromium,
       activeJobs: queue.activeCount,
+      userAgent: config.server.userAgent,
+      robotsToken: config.server.robotsToken,
       queueDepth: jobs.length,
       remoteStore: Boolean(store.remote),
       diskUsedPct: usage === null ? null : Number(usage.toFixed(1)),
@@ -150,12 +162,18 @@ export async function createServer({ config, logger = console, remote = remoteFr
       await assertNavigable(spec.rootUrl);
     }
 
-    const duplicate = await store.findDuplicate(kind, spec, { windowMs: config.server.dedupeWindowMs });
+    // Look-up and create are one step per process. Unserialised, two identical
+    // requests arriving together both find no duplicate and both create a job;
+    // with more than one job slot those would then crawl the same site at once.
+    const { job, duplicate } = await serialiseCreate(async () => {
+      const existing = await store.findDuplicate(kind, spec, { windowMs: config.server.dedupeWindowMs });
+      if (existing) return { job: existing, duplicate: true };
+      return { job: await store.create(kind, spec), duplicate: false };
+    });
     if (duplicate) {
-      return sendJson(res, 200, { ...jobView(duplicate), deduplicated: true });
+      return sendJson(res, 200, { ...jobView(job), deduplicated: true });
     }
 
-    const job = await store.create(kind, spec);
     queue.poke();
     res.setHeader('location', `/scrape/${kind}s/${job.jobId}`);
     sendJson(res, 202, jobView(job));
@@ -348,23 +366,6 @@ function readJsonBody(req) {
     });
     req.on('error', reject);
   });
-}
-
-export async function loadConfig() {
-  const raw = JSON.parse(await readFile(path.join(here, '..', 'config', 'defaults.json'), 'utf8'));
-  // Environment overrides exist for deployment (systemd sets these); the file
-  // stays the single description of what the knobs are.
-  if (process.env.PORT) raw.server.port = Number(process.env.PORT);
-  if (process.env.HOST) raw.server.host = process.env.HOST;
-  if (process.env.ARTEFACT_ROOT) raw.server.artefactRoot = process.env.ARTEFACT_ROOT;
-  if (process.env.JOB_ROOT) raw.server.jobRoot = process.env.JOB_ROOT;
-  if (process.env.CONCURRENT_JOBS) raw.server.concurrentJobs = Number(process.env.CONCURRENT_JOBS);
-  // Sizing knobs a small host needs to tighten without editing the config file.
-  if (process.env.ARTEFACT_TTL_DAYS) raw.gc.ttlDays = Number(process.env.ARTEFACT_TTL_DAYS);
-  if (process.env.DISK_HIGH_WATER_PCT) raw.gc.diskHighWaterPct = Number(process.env.DISK_HIGH_WATER_PCT);
-  if (process.env.ARTEFACT_BYTES_PER_JOB) raw.limits.artefactBytesPerJob = Number(process.env.ARTEFACT_BYTES_PER_JOB);
-  if (process.env.MAX_PAGES_CEILING) raw.limits.maxPagesCeiling = Number(process.env.MAX_PAGES_CEILING);
-  return raw;
 }
 
 const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
