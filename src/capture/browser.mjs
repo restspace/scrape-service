@@ -8,8 +8,17 @@ import { chromium, devices } from 'playwright';
 
 export const DESKTOP_VIEWPORT = { width: 1366, height: 900 };
 
+/**
+ * Extra Chromium switches from the environment. Containers often give /dev/shm
+ * only a few megabytes, where Chromium's shared-memory renderer crashes on
+ * large pages; the container image sets `--disable-dev-shm-usage` here.
+ */
+function extraArgs() {
+  return (process.env.CHROMIUM_EXTRA_ARGS ?? '').split(/\s+/).filter(Boolean);
+}
+
 export async function launchBrowser() {
-  return chromium.launch({ headless: true });
+  return chromium.launch({ headless: true, args: extraArgs() });
 }
 
 export async function makeDesktopContext(browser, { userAgent, ignoreHTTPSErrors = false }) {
@@ -32,7 +41,7 @@ export async function makeMobileContext(browser, { ignoreHTTPSErrors = false } =
 export async function chromiumVersion() {
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, args: extraArgs() });
     return browser.version();
   } finally {
     if (browser) await browser.close().catch(() => {});

@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "scrape-service",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Non-secret settings. Secrets (set once with `npx wrangler secret put`):
+  //   SCRAPE_TOKEN          bearer the RS2 /scrape proxy mount injects
+  //   R2_ACCOUNT_ID         account holding the bucket
+  //   R2_ACCESS_KEY_ID      R2 API token, Object Read & Write on R2_BUCKET only
+  //   R2_SECRET_ACCESS_KEY
+  "vars": {
+    "R2_BUCKET": "rs2-files"
+  },
+
+  "containers": [
+    {
+      "class_name": "ScrapeContainer",
+      // Built from the repository root so the image gets src/ and config/.
+      "image": "../../Dockerfile",
+      "image_build_context": "../..",
+      // 1/2 vCPU, 4 GiB memory, 8 GB disk — one crawl peaked at 887 MiB on EC2.
+      "instance_type": "standard-1",
+      "max_instances": 1
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "SCRAPER", "class_name": "ScrapeContainer" }]
+  },
+
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ScrapeContainer"] }],
+
+  "observability": { "enabled": true }
+}

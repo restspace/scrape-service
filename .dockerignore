@@ -1,0 +1,13 @@
+# Build context for the Cloudflare Container image: only what the service needs.
+node_modules
+var
+artefacts
+*.log
+.dev.vars
+.env
+.env.*
+.git
+test
+tools
+deploy
+RS2_WORK.md

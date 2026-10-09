@@ -78,7 +78,11 @@ export class ArtefactGC {
 
     const evicted = [];
     for (const job of candidates) {
-      await this.store.remove(job.jobId);
+      // With a remote, a terminal job's artefacts are already published, so disk
+      // pressure only costs the local copy. Deleting the durable copy because
+      // this instance's scratch disk is full would be the wrong trade.
+      if (this.store.remote) await this.store.evictLocal(job.jobId);
+      else await this.store.remove(job.jobId);
       evicted.push(job.jobId);
       const nowPct = await diskUsagePct(this.store.artefactRoot);
       if (nowPct === null || nowPct < this.diskHighWaterPct - 5) break; // hysteresis

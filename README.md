@@ -109,10 +109,63 @@ sitemap.
 
 ## Operational notes
 
-- Bind **127.0.0.1 only**. RS2 is the sole ingress; a publicly reachable sidecar
-  is an open SSRF proxy.
+- Bind **127.0.0.1 only** on a shared host. RS2 is the sole ingress; a publicly
+  reachable sidecar is an open SSRF proxy. (In the Cloudflare Container it binds
+  0.0.0.0, but the container is reachable only through the fronting Worker,
+  which demands a bearer token only RS2 holds.)
 - Every caller-supplied URL passes `net/guard.mjs` — private and loopback ranges
   are rejected at submit time and re-checked at navigation time.
 - `respectRobotsTxt` defaults on for *both* workers. The original scan path
   ignored robots entirely; that was defensible for a hand-picked local batch and
   is not defensible for a shared server.
+
+## Cloudflare deployment
+
+Production runs as a [Cloudflare Container](https://developers.cloudflare.com/containers/)
+behind a small fronting Worker (`deploy/cloudflare/`), with job records and
+artefacts in R2. The instance sleeps after ten idle minutes, so an idle month
+costs nothing beyond the Workers Paid plan.
+
+```
+RS2 /scrape (proxy, injects bearer) ─▶ scrape-service Worker (checks bearer)
+                                        └▶ ScrapeContainer "main" (this image)
+                                             └▶ R2 rs2-files
+                                                  _scrape/jobs/<id>.json
+                                                  main/.rs2-scrape/<id>/…  ◀─ RS2 /scrape-runs
+```
+
+What changes when the `R2_*` variables are set (`src/jobs/remote.mjs`):
+
+- Every job record is mirrored to R2, so a job outlives the instance that ran it
+  and a restarted instance recovers it. Running jobs are tied to a `bootId`, so a
+  recycled pid in a new container is never mistaken for the old worker.
+- A finished job's artefact tree is uploaded before its terminal status is
+  written, then evicted from local disk. A failed upload turns `succeeded` into
+  `failed` with `artefact_upload_failed` rather than pointing clients at nothing.
+- Reads of records, manifests, files and logs fall back to R2.
+- Disk-pressure GC evicts only local copies. Retention in R2 is two bucket
+  lifecycle rules (seven days on each prefix above).
+
+With no `R2_*` variables the service is disk-only, exactly as before.
+
+The Worker vetoes sleep while the service reports active or queued jobs
+(`onActivityExpired` probes `/health`), so a long crawl with nobody polling is
+not killed. The first request after a sleep pays a cold start of up to about
+twenty seconds.
+
+Deploy, from `deploy/cloudflare/` (Docker must be running; it builds the image):
+
+```
+npm ci
+npx wrangler deploy
+# once, or to rotate:
+npx wrangler secret put SCRAPE_TOKEN          # bearer RS2 injects
+npx wrangler secret put R2_ACCOUNT_ID
+npx wrangler secret put R2_ACCESS_KEY_ID      # R2 token: Object Read & Write, rs2-files only
+npx wrangler secret put R2_SECRET_ACCESS_KEY
+npx wrangler r2 bucket lifecycle add rs2-files scrape-artefacts-7d main/.rs2-scrape/ --expire-days 7
+npx wrangler r2 bucket lifecycle add rs2-files scrape-jobs-7d _scrape/jobs/ --expire-days 7
+```
+
+The Dockerfile's Playwright base image tag must match the `playwright` version in
+`package-lock.json`, or Chromium and the npm package disagree.

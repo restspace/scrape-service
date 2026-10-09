@@ -68,7 +68,9 @@ export class JobQueue {
   }
 
   async #claimNext() {
-    const { jobs } = await this.store.list({ status: STATUS.QUEUED, limit: 50 });
+    // Every queued job of this boot is on local disk (created here, or requeued
+    // here by recovery), so the poll never needs a remote listing.
+    const { jobs } = await this.store.list({ status: STATUS.QUEUED, limit: 50, localOnly: true });
     // list() is newest-first; take the oldest queued job so the queue is FIFO.
     const job = jobs[jobs.length - 1];
     if (!job) return null;
@@ -130,6 +132,7 @@ export class JobQueue {
       status: STATUS.RUNNING,
       startedAt: new Date().toISOString(),
       pid: child.pid,
+      bootId: this.store.bootId,
       attempt: job.attempt + 1,
     }).catch((e) => this.logger.error?.(`job ${job.jobId}: could not mark running: ${e.message}`));
 
@@ -185,33 +188,56 @@ export class JobQueue {
 
       if (pending) await this.store.mergeProgress(job.jobId, stripUndefined(pending)).catch(() => {});
 
+      let patch;
       if (oversized) {
-        await this.store.update(job.jobId, {
-          status: STATUS.FAILED, finishedAt, pid: null,
+        patch = {
+          status: STATUS.FAILED,
           error: { code: 'artefact_cap_exceeded', message: `job artefacts exceeded the ${cap}-byte cap` },
-        });
+        };
       } else if (timedOut) {
-        await this.store.update(job.jobId, {
-          status: STATUS.FAILED, finishedAt, pid: null,
+        patch = {
+          status: STATUS.FAILED,
           error: { code: 'wall_clock_exceeded', message: `job exceeded its ${budget}ms budget` },
-        });
+        };
       } else if (code === 0) {
-        await this.store.update(job.jobId, { status: STATUS.SUCCEEDED, finishedAt, pid: null, result, error: null });
+        patch = { status: STATUS.SUCCEEDED, result, error: null };
       } else if (code === 3) {
-        await this.store.update(job.jobId, {
-          status: STATUS.CANCELLED, finishedAt, pid: null,
-          error: workerError ?? { code: 'aborted', message: 'job aborted' },
-        });
+        patch = { status: STATUS.CANCELLED, error: workerError ?? { code: 'aborted', message: 'job aborted' } };
       } else {
-        await this.store.update(job.jobId, {
-          status: STATUS.FAILED, finishedAt, pid: null,
+        patch = {
+          status: STATUS.FAILED,
           error: workerError ?? {
             code: 'worker_failed',
             message: signal
               ? `worker killed by ${signal}`
               : `worker exited ${code}${stderr ? `: ${stderr.split('\n').filter(Boolean).slice(-1)[0]}` : ''}`,
           },
-        });
+        };
+      }
+
+      // Publish before the terminal write. A client that sees `succeeded` goes
+      // straight to /scrape-runs, so the artefacts must already be there; and a
+      // failed job's partial tree (its log especially) is worth keeping too. If
+      // the upload fails, a success becomes a failure rather than a lie.
+      let published = false;
+      try {
+        published = (await this.store.publishArtefacts(job.jobId)) !== null;
+      } catch (e) {
+        this.logger.error?.(`job ${job.jobId}: artefact upload failed: ${e.message}`);
+        if (patch.status === STATUS.SUCCEEDED) {
+          patch = {
+            status: STATUS.FAILED,
+            result,
+            error: { code: 'artefact_upload_failed', message: `artefacts could not be stored: ${e.message}` },
+          };
+        }
+      }
+
+      try {
+        await this.store.update(job.jobId, { ...patch, finishedAt, pid: null });
+        if (published) await this.store.evictLocal(job.jobId);
+      } catch (e) {
+        this.logger.error?.(`job ${job.jobId}: could not record outcome: ${e.message}`);
       }
       this.poke();
     });

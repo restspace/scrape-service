@@ -10,7 +10,7 @@
 // also accepted so that a direct curl can use the same path as the public URL.
 
 import http from 'node:http';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,6 +20,7 @@ import { ArtefactGC, diskUsagePct } from './jobs/gc.mjs';
 import { validateCrawlRequest, validateScanRequest, ValidationError } from './validate.mjs';
 import { assertNavigable, BlockedUrlError } from './net/guard.mjs';
 import { chromiumVersion } from './capture/browser.mjs';
+import { remoteFromEnv } from './jobs/remote.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const MAX_BODY_BYTES = 1_000_000;
@@ -27,11 +28,14 @@ const MAX_BODY_BYTES = 1_000_000;
 /** Job kinds with a worker behind them. Anything else is an explicit 501. */
 const IMPLEMENTED_KINDS = new Set(['crawl', 'scan']);
 
-export async function createServer({ config, logger = console }) {
+export async function createServer({ config, logger = console, remote = remoteFromEnv() }) {
   const store = new JobStore({
     jobRoot: path.resolve(here, '..', config.server.jobRoot),
     artefactRoot: path.resolve(here, '..', config.server.artefactRoot),
+    remote,
+    logger,
   });
+  if (remote) logger.info?.(`remote store: jobs -> ${remote.jobPrefix}/, artefacts -> ${remote.artefactPrefix}/`);
   await store.init();
 
   const recovered = await store.recover();
@@ -106,12 +110,15 @@ export async function createServer({ config, logger = console }) {
       cachedChromium = await chromiumVersion().catch((e) => `unavailable: ${e.message}`);
     }
     const usage = await diskUsagePct(store.artefactRoot);
-    const { jobs } = await store.list({ status: STATUS.QUEUED, limit: 200 });
+    // Local only: this is polled to decide whether the instance may sleep, and
+    // every queued job of this boot is on local disk.
+    const { jobs } = await store.list({ status: STATUS.QUEUED, limit: 200, localOnly: true });
     sendJson(res, 200, {
       ok: typeof cachedChromium === 'string' && !cachedChromium.startsWith('unavailable'),
       chromiumVersion: cachedChromium,
       activeJobs: queue.activeCount,
       queueDepth: jobs.length,
+      remoteStore: Boolean(store.remote),
       diskUsedPct: usage === null ? null : Number(usage.toFixed(1)),
       concurrency: config.server.concurrentJobs,
       uptimeS: Math.round(process.uptime()),
@@ -179,17 +186,11 @@ export async function createServer({ config, logger = console }) {
     if (!job) return sendJson(res, 404, { error: { code: 'not_found', message: `no job '${id}'` } });
     // Each worker names its own log after its kind; crawl.log is the one the
     // pipeline's client shim mirrors into runs/<slug>/.
-    const logPath = path.join(store.artefactDir(id), 'logs', `${job.kind}.log`);
-    try {
-      const text = await readFile(logPath, 'utf8');
-      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end(text);
-    } catch {
-      // The log only exists once the worker has written it; an empty 200 is a
-      // truer answer than a 404 for a job that is queued or still starting.
-      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('');
-    }
+    // The log only exists once the worker has written it; an empty 200 is a
+    // truer answer than a 404 for a job that is queued or still starting.
+    const log = await store.readArtefact(id, path.join('logs', `${job.kind}.log`)).catch(() => null);
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(log ? log.data : '');
   }
 
   /**
@@ -206,7 +207,7 @@ export async function createServer({ config, logger = console }) {
 
     const root = store.artefactDir(id);
     if (!relPath) {
-      const files = await manifest(root);
+      const files = await store.artefactManifest(id);
       return sendJson(res, 200, { jobId: id, files });
     }
 
@@ -217,16 +218,15 @@ export async function createServer({ config, logger = console }) {
     if (target !== root && !target.startsWith(root + path.sep)) {
       return sendJson(res, 400, { error: { code: 'path_escape', message: 'artefact path escapes the job directory' } });
     }
-    try {
-      const data = await readFile(target);
-      res.writeHead(200, {
-        'content-type': contentTypeFor(target),
-        'content-length': data.length,
-      });
-      res.end(data);
-    } catch {
-      sendJson(res, 404, { error: { code: 'not_found', message: `no artefact '${decoded}'` } });
+    const artefact = await store.readArtefact(id, path.relative(root, target));
+    if (!artefact) {
+      return sendJson(res, 404, { error: { code: 'not_found', message: `no artefact '${decoded}'` } });
     }
+    res.writeHead(200, {
+      'content-type': artefact.contentType,
+      'content-length': artefact.data.length,
+    });
+    res.end(artefact.data);
   }
 
   async function deleteJob(res, id) {
@@ -288,46 +288,6 @@ function jobView(job) {
     artefacts: `/scrape-runs/${job.jobId}/`,
     self: `/scrape/${job.kind}s/${job.jobId}`,
   };
-}
-
-/** Flat recursive listing of a job's artefacts, with forward-slash paths. */
-async function manifest(root) {
-  const files = [];
-  const walk = async (dir, prefix) => {
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      const abs = path.join(dir, e.name);
-      const rel = prefix ? `${prefix}/${e.name}` : e.name;
-      if (e.isDirectory()) await walk(abs, rel);
-      else {
-        try { files.push({ path: rel, bytes: (await stat(abs)).size }); } catch { /* raced with GC */ }
-      }
-    }
-  };
-  await walk(root, '');
-  return files;
-}
-
-const CONTENT_TYPES = {
-  '.json': 'application/json; charset=utf-8',
-  '.md': 'text/markdown; charset=utf-8',
-  '.html': 'text/html; charset=utf-8',
-  '.xml': 'application/xml; charset=utf-8',
-  '.log': 'text/plain; charset=utf-8',
-  '.txt': 'text/plain; charset=utf-8',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-};
-
-function contentTypeFor(p) {
-  return CONTENT_TYPES[path.extname(p).toLowerCase()] ?? 'application/octet-stream';
 }
 
 function sendJson(res, status, body) {

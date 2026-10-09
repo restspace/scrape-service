@@ -1,0 +1,17 @@
+{
+  "name": "scrape-service-cloudflare",
+  "private": true,
+  "type": "module",
+  "description": "Fronting Worker and Container config for running scrape-service on Cloudflare.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dry-run": "wrangler deploy --dry-run",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  },
+  "devDependencies": {
+    "wrangler": "4.126.0"
+  }
+}
